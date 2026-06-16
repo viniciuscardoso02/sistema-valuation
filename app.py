@@ -9,10 +9,10 @@ st.title("🏢 Ferramenta de Análise Home 2 Invest")
 # 1. Puxa apenas a lista de tipos de imóveis para o filtro lateral
 @st.cache_data
 def obter_tipos():
-    # O DuckDB lê direto do parquet sem estourar a memória
+    # O DuckDB lê direto dos ficheiros parquet. O union_by_name resolve as colunas vazias
     query = """
     SELECT DISTINCT "Descrição do uso (IPTU)" 
-    FROM 'base_itbi_parte_*.parquet' 
+    FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) 
     WHERE "Descrição do uso (IPTU)" IS NOT NULL
     """
     df_tipos = duckdb.query(query).df()
@@ -28,9 +28,8 @@ tipo_selecionado = st.sidebar.selectbox("Tipo de Imóvel", tipos)
 mod_filtro = st.sidebar.selectbox("Estado de Conservação", ["Ambos", "Apenas Modernizadas", "Apenas Antigas"])
 
 # --- LÓGICA DE BUSCA OTIMIZADA ---
-# O sistema agora aguarda você digitar uma rua para não carregar 2 milhões de linhas à toa
 if rua:
-    with st.spinner(f"Buscando histórico de transações na rua '{rua}'..."):
+    with st.spinner(f"A procurar histórico de transações na rua '{rua}'..."):
         
         # Monta a regra de busca (SQL)
         condicoes = [f"LOWER(\"Nome do Logradouro\") LIKE '%{rua.lower()}%'"]
@@ -45,8 +44,8 @@ if rua:
             
         clausula_where = " AND ".join(condicoes)
         
-        # O DuckDB vai direto nos arquivos Parquet buscar apenas as linhas que dão "match" com a rua
-        query_final = f"SELECT * FROM 'base_itbi_parte_*.parquet' WHERE {clausula_where}"
+        # Adicionado o comando de leitura robusta para ficheiros multiplos
+        query_final = f"SELECT * FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE {clausula_where}"
         
         try:
             dados_filtrados = duckdb.query(query_final).df()
@@ -63,6 +62,6 @@ if rua:
             st.dataframe(dados_filtrados, use_container_width=True)
             
         except Exception as e:
-            st.error(f"Erro ao buscar os dados: {e}")
+            st.error(f"Erro ao procurar os dados: {e}")
 else:
     st.info("👈 Digite o nome de uma rua no menu lateral para começar a análise.")
