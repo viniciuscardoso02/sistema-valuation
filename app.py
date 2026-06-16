@@ -6,10 +6,8 @@ import duckdb
 st.set_page_config(page_title="Valuation ITBI SP", layout="wide")
 st.title("🏢 Ferramenta de Análise Home 2 Invest")
 
-# 1. Puxa apenas a lista de tipos de imóveis para o filtro lateral
 @st.cache_data
 def obter_tipos():
-    # O DuckDB lê direto dos ficheiros parquet. O union_by_name resolve as colunas vazias
     query = """
     SELECT DISTINCT "Descrição do uso (IPTU)" 
     FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) 
@@ -31,7 +29,6 @@ mod_filtro = st.sidebar.selectbox("Estado de Conservação", ["Ambos", "Apenas M
 if rua:
     with st.spinner(f"A procurar histórico de transações na rua '{rua}'..."):
         
-        # Monta a regra de busca (SQL)
         condicoes = [f"LOWER(\"Nome do Logradouro\") LIKE '%{rua.lower()}%'"]
         
         if tipo_selecionado != "Todos":
@@ -44,7 +41,6 @@ if rua:
             
         clausula_where = " AND ".join(condicoes)
         
-        # Adicionado o comando de leitura robusta para ficheiros multiplos
         query_final = f"SELECT * FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE {clausula_where}"
         
         try:
@@ -57,9 +53,35 @@ if rua:
                 v_num = pd.to_numeric(dados_filtrados[coluna_valor], errors='coerce')
                 media = v_num.mean()
                 st.metric("Preço Médio na Região", f"R$ {media:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.'))
-            
-            # Mostra a tabela apenas com a rua filtrada (super leve)
-            st.dataframe(dados_filtrados, use_container_width=True)
+                
+                # --- INÍCIO DAS CORREÇÕES VISUAIS DA TABELA ---
+                df_visual = dados_filtrados.copy()
+                
+                # Correção 1: Ajustar o Bairro (Se estiver 'nan', puxa o dado da coluna Referência)
+                df_visual['Bairro'] = df_visual.apply(
+                    lambda row: row['Referência'] if str(row['Bairro']).strip().lower() == 'nan' else row['Bairro'], 
+                    axis=1
+                )
+                
+                # Limpar a palavra 'nan' que sobrou na coluna Referência
+                df_visual['Referência'] = df_visual['Referência'].astype(str).replace('nan', '-')
+                
+                # Correção 2: Formatar o Valor de Transação no padrão 1.500.000,00
+                def formatar_moeda(valor):
+                    try:
+                        v = float(valor)
+                        if pd.isna(v): return "-"
+                        # Formata com separador de milhar e decimal do Brasil
+                        return f"R$ {v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+                    except:
+                        return valor
+                        
+                df_visual[coluna_valor] = df_visual[coluna_valor].apply(formatar_moeda)
+                # --- FIM DAS CORREÇÕES ---
+                
+                st.dataframe(df_visual, use_container_width=True)
+            else:
+                st.warning("Nenhuma transação encontrada com estes filtros.")
             
         except Exception as e:
             st.error(f"Erro ao procurar os dados: {e}")
