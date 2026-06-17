@@ -1,3 +1,7 @@
+streamlit
 pandas
 pyarrow
 duckdb
+geopy
+folium
+streamlit-folium
