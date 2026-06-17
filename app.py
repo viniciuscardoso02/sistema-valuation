@@ -45,6 +45,14 @@ st.sidebar.markdown("---")
 st.sidebar.header("🎯 Filtros de Ativo")
 tipo = st.sidebar.selectbox("Uso do Imóvel", tipos_disp)
 
+# NOVO: Slider duplo para o período das transações
+ano_min, ano_max = st.sidebar.slider(
+    "Ano da Transação", 
+    min_value=2010, 
+    max_value=date.today().year, 
+    value=(2021, date.today().year)
+)
+
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
 if rua and num:
     with st.spinner("A mapear o perímetro espacial e a calcular o Valuation..."):
@@ -54,11 +62,9 @@ if rua and num:
         if loc:
             lat_c, lon_c = loc.latitude, loc.longitude
             
-            # Construção do filtro opcional de uso
             filtro_uso = f"AND \"Descrição do uso (IPTU)\" = '{tipo}'" if tipo != "Todos" else ""
             
-            # ARQUITETURA OTIMIZADA: O filtro de raio (WHERE dist_metros <= raio) corre no motor SQL.
-            # O Streamlit só recebe os dados finais, poupando a memória do servidor.
+            # A busca espacial ultra-rápida continua no DuckDB
             query = f"""
             WITH base_distancia AS (
                 SELECT *,
@@ -79,17 +85,23 @@ if rua and num:
                 st.stop()
             
             if not df.empty:
+                # --- NOVO: FILTRO INTELIGENTE DE ANO DA TRANSAÇÃO ---
+                col_data = 'Data de Transação'
+                if col_data in df.columns:
+                    # Extrai à força os 4 dígitos do ano (Regex) e converte para número
+                    df['Ano_Transacao_Ext'] = df[col_data].astype(str).str.extract(r'(\d{4})').astype(float)
+                    # Corta do DataFrame as transações fora do período selecionado
+                    df = df[(df['Ano_Transacao_Ext'] >= ano_min) & (df['Ano_Transacao_Ext'] <= ano_max)]
+
                 # --- LIMPEZA ESTRUTURAL DE DADOS ---
                 col_val = 'Valor de Transação (declarado pelo contribuinte)'
                 col_area = 'Área Construída (m2)'
                 col_ano = 'Ano_Construcao_Geo'
                 
-                # Força a tipagem numérica, descartando lixo textual (resolve o TypeError de médias)
                 df[col_val] = pd.to_numeric(df[col_val], errors='coerce')
                 df[col_area] = pd.to_numeric(df[col_area], errors='coerce')
                 df[col_ano] = pd.to_numeric(df[col_ano], errors='coerce')
                 
-                # Remove transações que ficaram sem valor financeiro após a limpeza
                 df = df.dropna(subset=[col_val])
 
                 if not df.empty:
@@ -112,21 +124,23 @@ if rua and num:
                     
                     for _, r in df.iterrows():
                         if pd.notna(r['Latitude']) and pd.notna(r['Longitude']):
-                            popup_txt = f"{r.get('Nome do Logradouro', 'Sem Rua')}, {r.get('Número', '')}"
+                            # Agora o mapa exibe a data exata da venda ao clicar no pino
+                            popup_txt = f"{r.get('Nome do Logradouro', 'Sem Rua')}, {r.get('Número', '')}<br><b>Data:</b> {r.get(col_data, 'N/A')}"
                             folium.CircleMarker([r['Latitude'], r['Longitude']], radius=6, color="darkblue", fill_color="lightblue", fill_opacity=0.8, popup=popup_txt).add_to(m)
                     
                     folium_static(m, width=1200, height=500)
                     
                     # --- TABELA DE SUPORTE ---
                     st.subheader("Extração da Base Filtrada")
-                    df_visual = df.drop(columns=['dist_metros']).copy()
+                    colunas_remover = ['dist_metros', 'Ano_Transacao_Ext']
+                    df_visual = df.drop(columns=[c for c in colunas_remover if c in df.columns]).copy()
                     df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                     st.dataframe(df_visual, use_container_width=True)
                 else:
-                    st.warning("Foram encontrados imóveis na área, mas nenhum possui um registo financeiro válido.")
+                    st.warning(f"Existem imóveis na área, mas nenhum possui um registo financeiro válido fechado entre {ano_min} e {ano_max}.")
             else:
-                st.warning(f"Sem transações identificadas num raio de {raio}m para este perfil. Alargue a busca.")
+                st.warning(f"Sem transações identificadas num raio de {raio}m. Alargue a busca ou remova os filtros.")
         else:
-            st.error("Não foi possível processar as coordenadas deste logradouro.")
+            st.error("Não foi possível processar as coordenadas deste endereço.")
 else:
     st.info("👈 Indique o Logradouro e o Número para acionar o motor espacial.")
