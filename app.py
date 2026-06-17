@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import duckdb
+from datetime import date
 
 st.set_page_config(page_title="Valuation ITBI SP", layout="wide")
 st.title("🏢 Ferramenta de Análise Home 2 Invest")
@@ -13,8 +14,8 @@ def obter_filtros_dinamicos():
     """
     df_filtros = duckdb.query(query).df()
     
-    tipos = ["Todos"] + sorted([t for t in df_filtros['Descrição do uso (IPTU)'].unique() if t and t != '-'])
-    bairros = ["Todos"] + sorted([b for b in df_filtros['Bairro'].unique() if b and b != '-'])
+    tipos = ["Todos"] + sorted([t for t in df_filtros['Descrição do uso (IPTU)'].unique() if t and str(t) != '-'])
+    bairros = ["Todos"] + sorted([b for b in df_filtros['Bairro'].unique() if b and str(b) != '-'])
     
     return tipos, bairros
 
@@ -30,7 +31,7 @@ mod_filtro = st.sidebar.selectbox("Estado de Conservação", ["Ambos", "Apenas M
 
 # --- LÓGICA DE BUSCA ---
 if rua or bairro_selecionado != "Todos":
-    with st.spinner("A cruzar dados históricos da região..."):
+    with st.spinner("Cruzando dados históricos e atributos físicos da região..."):
         
         condicoes = []
         if rua:
@@ -61,25 +62,33 @@ if rua or bairro_selecionado != "Todos":
                 col_area_terreno = 'Área do Terreno (m2)'
                 col_area_const = 'Área Construída (m2)'
                 
-                # Conversão segura para números, ignorando textos acidentais da prefeitura
                 v_num = pd.to_numeric(dados_filtrados[coluna_valor], errors='coerce')
                 a_terreno = pd.to_numeric(dados_filtrados[col_area_terreno], errors='coerce')
                 a_const = pd.to_numeric(dados_filtrados[col_area_const], errors='coerce')
                 
-                # Agrupa em um mini banco de dados para os cálculos de metro quadrado
                 df_calc = pd.DataFrame({'Valor': v_num, 'Area_T': a_terreno, 'Area_C': a_const})
                 
                 media_absoluta = df_calc['Valor'].mean()
                 
-                # Calcula o valor do m² linha por linha, apenas onde a área é maior que zero
                 df_terreno_valido = df_calc[df_calc['Area_T'] > 0]
                 media_m2_terreno = (df_terreno_valido['Valor'] / df_terreno_valido['Area_T']).mean() if not df_terreno_valido.empty else 0
                 
                 df_const_valido = df_calc[df_calc['Area_C'] > 0]
                 media_m2_const = (df_const_valido['Valor'] / df_const_valido['Area_C']).mean() if not df_const_valido.empty else 0
                 
-                # --- EXIBIÇÃO EM 3 COLUNAS VISUAIS ---
-                col1, col2, col3 = st.columns(3)
+                # --- CÁLCULO DE IDADE MÉDIA (NOVIDADE DO GEOSAMPA) ---
+                idade_media_texto = "Sem dados"
+                if 'Ano_Construcao_Geo' in dados_filtrados.columns:
+                    anos_construcao = pd.to_numeric(dados_filtrados['Ano_Construcao_Geo'], errors='coerce')
+                    anos_validos = anos_construcao[anos_construcao > 1500] # Ignora zeros ou erros antigos
+                    
+                    if not anos_validos.empty:
+                        ano_atual = date.today().year
+                        idade_media = ano_atual - anos_validos.mean()
+                        idade_media_texto = f"{int(idade_media)} anos"
+
+                # --- EXIBIÇÃO EM 4 COLUNAS VISUAIS ---
+                col1, col2, col3, col4 = st.columns(4)
                 
                 def formata_moeda(valor):
                     return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
@@ -87,21 +96,22 @@ if rua or bairro_selecionado != "Todos":
                 col1.metric("Valor Médio (Absoluto)", formata_moeda(media_absoluta))
                 
                 if media_m2_terreno > 0:
-                    col2.metric("Valor Médio / m² (Terreno)", formata_moeda(media_m2_terreno))
+                    col2.metric("Média / m² (Terreno)", formata_moeda(media_m2_terreno))
                 else:
-                    col2.metric("Valor Médio / m² (Terreno)", "Sem dados de área")
+                    col2.metric("Média / m² (Terreno)", "-")
                     
                 if media_m2_const > 0:
-                    col3.metric("Valor Médio / m² (Construída)", formata_moeda(media_m2_const))
+                    col3.metric("Média / m² (Construída)", formata_moeda(media_m2_const))
                 else:
-                    col3.metric("Valor Médio / m² (Construída)", "Sem dados de área")
+                    col3.metric("Média / m² (Construída)", "-")
+                    
+                col4.metric("Idade Média Oficial", idade_media_texto)
                 
-                st.markdown("---") # Linha divisória
+                st.markdown("---") 
                 
                 # --- TABELA DE DADOS ---
                 df_visual = dados_filtrados.copy()
                 
-                # Aplica a formatação de Reais na tabela
                 def formatar_tabela(valor):
                     try:
                         v = float(valor)
