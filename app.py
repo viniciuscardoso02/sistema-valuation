@@ -33,7 +33,6 @@ raio = st.sidebar.slider("Raio de busca (metros)", 100, 2500, 500)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 Filtros de Ativo")
-# Restrito estritamente às duas opções solicitadas
 tipo = st.sidebar.selectbox("Uso do Imóvel", ["Residenciais", "Apartamentos"])
 
 # Filtro temporal preservado para consistência de mercado
@@ -52,7 +51,7 @@ area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_valu
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
 if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
     with st.spinner("A mapear o perímetro espacial e a calcular o Valuation..."):
-        geolocator = Nominatim(user_agent="h2i_valuation_pro_v4")
+        geolocator = Nominatim(user_agent="h2i_valuation_pro_v5")
         
         # Montagem dinâmica do endereço de geocodificação
         endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
@@ -64,7 +63,7 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
             # --- CONSTRUÇÃO DINÂMICA DOS FILTROS SQL ---
             filtros_sql = []
             
-            # Correção estrita e precisa do filtro de uso
+            # Filtro de uso do imóvel
             if tipo == "Residenciais":
                 filtros_sql.append("(UPPER(\"Descrição do uso (IPTU)\") LIKE '%RESIDÊN%' OR UPPER(\"Descrição do uso (IPTU)\") LIKE '%CASA%')")
             elif tipo == "Apartamentos":
@@ -73,7 +72,7 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
             # Filtro de período temporal diretamente em SQL
             filtros_sql.append(f"TRY_CAST(REGEXP_EXTRACT(\"Data de Transação\", '(\\d{{4}})') AS INTEGER) BETWEEN {ano_min} AND {ano_max}")
             
-            # Filtros de similaridade de área (Opcionais: aplicados apenas se maiores que zero)
+            # Filtros de similaridade de área (Opcionais)
             if area_const_alvo > 0:
                 filtros_sql.append(f"TRY_CAST(\"Área Construída (m2)\" AS FLOAT) BETWEEN {area_const_alvo * 0.75} AND {area_const_alvo * 1.25}")
             if area_terr_alvo > 0:
@@ -105,31 +104,40 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
                 # --- ALINHAMENTO E LIMPEZA DE TIPAGEM NO PANDAS ---
                 col_val = 'Valor de Transação (declarado pelo contribuinte)'
                 col_area = 'Área Construída (m2)'
+                col_terr = 'Área do Terreno (m2)'
                 col_ano = 'Ano_Construcao_Geo'
                 
                 df[col_val] = pd.to_numeric(df[col_val], errors='coerce')
                 df[col_area] = pd.to_numeric(df[col_area], errors='coerce')
+                df[col_terr] = pd.to_numeric(df[col_terr], errors='coerce')
                 df[col_ano] = pd.to_numeric(df[col_ano], errors='coerce')
                 
                 df = df.dropna(subset=[col_val])
 
                 if not df.empty:
-                    # --- PANEL DE MÉTRICAS ---
+                    # --- CORREÇÃO DA IDADE PREDIAL ---
+                    # Desconsidera anos zerados ou irreais vindos da base original
+                    ano_atual = date.today().year
+                    anos_validos = df[col_ano][(df[col_ano] > 1800) & (df[col_ano] <= ano_atual)]
+                    
+                    if not anos_validos.empty:
+                        idade_media = ano_atual - anos_validos.mean()
+                        texto_idade = f"{int(idade_media)} anos"
+                    else:
+                        texto_idade = "Sem Registro Oficial"
+
+                    # --- PAINEL DE MÉTRICAS ---
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Amostras Encontradas", len(df))
                     col2.metric("Valor Médio", formata_moeda(df[col_val].mean()))
                     col3.metric("Média / m² Construído", formata_moeda((df[col_val] / df[col_area]).mean()))
-                    
-                    ano_medio = df[col_ano].mean()
-                    texto_idade = f"{int(date.today().year - ano_medio)} anos" if not pd.isna(ano_medio) else "Sem Registo"
                     col4.metric("Idade Média Predial", texto_idade)
                     
                     st.markdown("---")
                     
-                    # --- MAPA DE CALOR E LOCALIZAÇÃO ---
+                    # --- MAPA DE LOCALIZAÇÃO ---
                     m = folium.Map([lat_c, lon_c], zoom_start=15)
                     
-                    # Marcador do alvo (com ou sem número)
                     txt_alvo = f"Alvo: {rua}, {num}" if num else f"Alvo: {rua} (Centro)"
                     folium.Marker([lat_c, lon_c], popup=txt_alvo, icon=folium.Icon(color="red", icon="home")).add_to(m)
                     folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
@@ -141,15 +149,34 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
                     
                     folium_static(m, width=1200, height=500)
                     
+                    st.markdown("---")
+                    
+                    # --- TABELA SECUNDÁRIA: TOP 5 VALOR / ÁREA DE TERRENO ---
+                    st.subheader("🔝 Top 5 Amostras mais Representativas (Valor / m² Terreno)")
+                    
+                    df_terreno_valido = df[df[col_terr] > 0].copy()
+                    if not df_terreno_valido.empty:
+                        df_terreno_valido['Valor/m² Terreno'] = df_terreno_valido[col_val] / df_terreno_valido[col_terr]
+                        df_top5 = df_terreno_valido.sort_values(by='Valor/m² Terreno', ascending=False).head(5).copy()
+                        
+                        df_top5_visual = df_top5.drop(columns=['dist_metros'], errors='ignore')
+                        df_top5_visual['Valor/m² Terreno'] = df_top5_visual['Valor/m² Terreno'].apply(formata_moeda)
+                        df_top5_visual[col_val] = df_top5_visual[col_val].apply(formata_moeda)
+                        st.dataframe(df_top5_visual, use_container_width=True)
+                    else:
+                        st.info("Nenhuma amostra com área de terreno válida para calcular a tabela de indicadores.")
+
+                    st.markdown("---")
+
                     # --- TABELA COMPLETA ---
-                    st.subheader("Planilha de Análise de Amostras Detalhada")
+                    st.subheader("📋 Planilha de Análise de Amostras Detalhada")
                     df_visual = df.drop(columns=['dist_metros'], errors='ignore').copy()
                     df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                     st.dataframe(df_visual, use_container_width=True)
                 else:
                     st.warning("Imóveis identificados no perímetro, mas nenhum possui registros financeiros computáveis.")
             else:
-                st.warning(f"Nenhum comparável de uso '{tipo}' localizado no raio de {raio}m para as especificações digitadas.")
+                st.warning(f"Nenhum comparável localizado no raio de {raio}m para as especificações digitadas.")
         else:
             st.error("Não foi possível geocodificar o logradouro digitado. Verifique o nome da rua.")
 else:
