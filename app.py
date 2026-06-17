@@ -13,7 +13,7 @@ st.title("🏢 Sistema de Valuation Inteligente - Home 2 Invest")
 
 # --- VERIFICAÇÃO DE DADOS ---
 arquivos = glob.glob('base_itbi_parte_*.parquet')
-if not archivos:
+if not arquivos:
     st.error("Erro Crítico: Ficheiros de dados não encontrados na raiz do repositório.")
     st.stop()
 
