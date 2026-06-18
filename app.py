@@ -26,18 +26,20 @@ def formata_moeda(valor):
     except:
         return "-"
 
+# --- NOVO SISTEMA DE LISTAGEM DE BAIRROS (Sem Cache Travado) ---
 @st.cache_data
-def obter_filtros():
+def carregar_lista_bairros():
     try:
-        query = 'SELECT DISTINCT "Descrição do uso (IPTU)", Bairro FROM read_parquet("base_itbi_parte_*.parquet", union_by_name=true)'
+        query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
         df = duckdb.query(query).df()
-        tipos = ["Residenciais", "Apartamentos"]
-        bairros = ["Selecione..."] + sorted([b for b in df.iloc[:,1].unique() if b and str(b) != '-'])
-        return tipos, bairros
-    except:
-        return ["Residenciais", "Apartamentos"], ["Selecione..."]
+        bairros_validos = [str(b).strip() for b in df['Bairro'].unique() if pd.notna(b) and str(b).strip() not in ('', '-')]
+        return ["Selecione..."] + sorted(bairros_validos)
+    except Exception as e:
+        st.sidebar.error(f"Aviso: Não foi possível carregar a coluna 'Bairro' ({e})")
+        return ["Selecione..."]
 
-tipos_disp, bairros_disp = obter_filtros()
+bairros_disp = carregar_lista_bairros()
+tipos_disp = ["Residenciais", "Apartamentos"]
 
 # --- BARRA LATERAL ---
 st.sidebar.header("📍 Parâmetros de Busca")
@@ -89,7 +91,7 @@ if rua or bairro_alvo != "Selecione...":
         try:
             if rua:
                 # Busca Espacial (Geopy + Haversine)
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_v10")
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v11")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
@@ -112,10 +114,11 @@ if rua or bairro_alvo != "Selecione...":
                     st.error("Logradouro não encontrado no mapa.")
                     st.stop()
             else:
-                # Busca por Bairro (Ignora Geopy)
+                # Busca por Bairro (Ignora Geopy, previne erro com apóstrofos)
+                bairro_sql = bairro_alvo.replace("'", "''")
                 query = f"""
                 SELECT * FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true)
-                WHERE Bairro = '{bairro_alvo}' {condicao_extra}
+                WHERE Bairro = '{bairro_sql}' {condicao_extra}
                 """
                 df_bruto = duckdb.query(query).df()
                 
@@ -169,7 +172,7 @@ if rua or bairro_alvo != "Selecione...":
                     idade_media = ano_atual - anos_validos.median() if not anos_validos.empty else None
                     texto_idade = f"{int(idade_media)} anos" if pd.notna(idade_media) else "Sem Registro"
 
-                    # --- PAINEL DE MÉTRICAS (AGORA USANDO MEDIANA PARA EVITAR OUTLIERS) ---
+                    # --- PAINEL DE MÉTRICAS (USANDO MEDIANA) ---
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Amostras no Período", len(df))
                     col2.metric("Valor Mediano", formata_moeda(df[col_val].median()))
@@ -201,7 +204,6 @@ if rua or bairro_alvo != "Selecione...":
                         df_grafico['Faixa de Área'] = df_grafico[col_area].apply(classificar_faixa_area)
                         df_grafico['Status'] = df_grafico['Categoria'].apply(lambda x: 'Modernizado' if 'Modernizado' in x else 'Antigo')
                         
-                        # UTILIZANDO MEDIANA PARA O GRÁFICO (Corta o efeito de terrenos cadastrados com 10m² por erro)
                         resumo_grafico = df_grafico.groupby(['Faixa de Área', 'Status'])['R$/m² Terreno'].median().reset_index()
                         
                         resumo_grafico['Texto_Valor'] = resumo_grafico['R$/m² Terreno'].apply(lambda x: f"R$ {int(x):,}".replace(',', '.') + "/m²")
@@ -230,23 +232,27 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
-                    # --- MAPA DE LOCALIZAÇÃO (Só exibe se houver Lat/Lon) ---
+                    # --- MAPA DE LOCALIZAÇÃO OTIMIZADO ---
+                    st.subheader("📍 Distribuição Espacial")
                     if rua and lat_c and lon_c:
-                        st.subheader("📍 Distribuição Espacial")
                         m = folium.Map([lat_c, lon_c], zoom_start=15)
-                        
                         txt_alvo = f"Alvo: {rua}, {num}" if num else f"Alvo: {rua} (Centro)"
                         folium.Marker([lat_c, lon_c], popup=txt_alvo, icon=folium.Icon(color="red", icon="home")).add_to(m)
                         folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
+                    else:
+                        # Se buscou por bairro, calcula o centro do bairro pelas coordenadas retornadas
+                        lat_media = df['Latitude'].mean()
+                        lon_media = df['Longitude'].mean()
+                        m = folium.Map([lat_media, lon_media], zoom_start=14)
                         
-                        for _, r in df.iterrows():
-                            if pd.notna(r['Latitude']) and pd.notna(r['Longitude']):
-                                cor_pino = "green" if 'Modernizado' in r.get('Categoria', '') else "gray"
-                                popup_txt = f"<b>{r.get('Categoria', '')}</b><br>{r.get('Nome do Logradouro', '')}<br>Valor: {formata_moeda(r[col_val])}<br>Área: {r.get(col_area)}m²"
-                                folium.CircleMarker([r['Latitude'], r['Longitude']], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
-                        
-                        folium_static(m, width=1200, height=500)
-                        st.markdown("---")
+                    for _, r in df.iterrows():
+                        if pd.notna(r['Latitude']) and pd.notna(r['Longitude']):
+                            cor_pino = "green" if 'Modernizado' in r.get('Categoria', '') else "gray"
+                            popup_txt = f"<b>{r.get('Categoria', '')}</b><br>{r.get('Nome do Logradouro', '')}<br>Valor: {formata_moeda(r[col_val])}<br>Área: {r.get(col_area)}m²"
+                            folium.CircleMarker([r['Latitude'], r['Longitude']], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
+                    
+                    folium_static(m, width=1200, height=500)
+                    st.markdown("---")
                     
                     # --- TABELAS ---
                     st.subheader("🔝 Top 5 (Valor / m² Terreno)")
