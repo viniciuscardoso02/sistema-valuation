@@ -51,7 +51,7 @@ area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_valu
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
 if rua:
     with st.spinner("A mapear o perímetro, analisar expansões históricas e calcular Valuation..."):
-        geolocator = Nominatim(user_agent="h2i_valuation_pro_v8")
+        geolocator = Nominatim(user_agent="h2i_valuation_pro_v9")
         
         endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
         loc = geolocator.geocode(endereco_busca, timeout=10)
@@ -59,7 +59,7 @@ if rua:
         if loc:
             lat_c, lon_c = loc.latitude, loc.longitude
             
-            # Construção dos filtros SQL para a base espacial
+            # Construção dos filtros SQL
             filtros_sql = []
             if tipo == "Residenciais":
                 filtros_sql.append("(UPPER(\"Descrição do uso (IPTU)\") LIKE '%RESIDÊN%' OR UPPER(\"Descrição do uso (IPTU)\") LIKE '%CASA%')")
@@ -73,7 +73,6 @@ if rua:
                 
             condicao_extra = " AND " + " AND ".join(filtros_sql) if filtros_sql else ""
             
-            # A query agora traz o histórico completo de transações no raio para podermos ver as variações de área
             query = f"""
             WITH base_distancia AS (
                 SELECT *,
@@ -108,21 +107,17 @@ if rua:
                 df = df.dropna(subset=[col_val, 'Ano_Transacao'])
 
                 if not df.empty:
-                    # --- NOVO: MOTOR DE INTELIGÊNCIA DE RETROFIT (VARIAÇÃO DE ÁREA) ---
-                    # Usa o SQL como chave. Se não tiver, junta Rua + Número
+                    # INTELIGÊNCIA DE RETROFIT: Histórico de Variação de Área
                     df['Chave_Imovel'] = df['N° do Cadastro (SQL)'].fillna(df['Nome do Logradouro'] + df['Número'])
                     
                     def classificar_retrofit(grupo):
                         areas_unicas = grupo[col_area].dropna().unique()
-                        # Se a variação entre a maior e a menor área histórica for maior que 10m²
                         houve_expansao = len(areas_unicas) > 1 and (max(areas_unicas) - min(areas_unicas)) > 10
                         
                         categorias = []
                         for _, row in grupo.iterrows():
-                            # Regra 1: Oficialmente recente pela prefeitura
                             if pd.notna(row[col_ano]) and row[col_ano] >= 2018:
                                 categorias.append('Modernizado (≥ 2018)')
-                            # Regra 2: Imóvel sofreu retrofit/ampliação e esta é a versão ampliada
                             elif houve_expansao and row[col_area] == max(areas_unicas):
                                 categorias.append('Modernizado (Retrofit)')
                             else:
@@ -131,8 +126,6 @@ if rua:
                         return grupo
                         
                     df = df.groupby('Chave_Imovel', group_keys=False).apply(classificar_retrofit)
-                    
-                    # Após classificar o histórico, cortamos para a janela de anos que você quer analisar no dashboard
                     df = df[(df['Ano_Transacao'] >= ano_min) & (df['Ano_Transacao'] <= ano_max)]
 
                     if not df.empty:
@@ -150,7 +143,7 @@ if rua:
                         
                         st.markdown("---")
                         
-                        # --- GRÁFICO: ANÁLISE DE VALORIZAÇÃO POR FAIXA DE ÁREA ---
+                        # --- GRÁFICO: ÁGIO DE MERCADO ---
                         st.subheader("📊 Ágio de Mercado: Modernizadas vs Antigas (Por m² de Terreno)")
                         
                         df_grafico = df.copy()
@@ -160,23 +153,56 @@ if rua:
                         if not df_grafico.empty:
                             df_grafico['R$/m² Terreno'] = df_grafico[col_val] / df_grafico[col_terr]
                             
-                            # Agrupamento matemático de 50 em 50m²
-                            df_grafico['Piso_Faixa'] = (df_grafico[col_area] // 50) * 50
-                            df_grafico['Faixa de Área'] = df_grafico['Piso_Faixa'].apply(lambda x: f"{int(x):03d} a {int(x+50):03d} m²")
+                            # CLASSIFICAÇÃO EXATA DO EIXO X
+                            def classificar_faixa_area(area):
+                                if area < 300: return '<300m²'
+                                elif area < 400: return '300 a 399m²'
+                                elif area < 500: return '400 a 499m²'
+                                elif area < 600: return '500 a 599m²'
+                                elif area < 700: return '600 a 699m²'
+                                elif area < 800: return '700 a 799m²'
+                                elif area < 900: return '800 a 899m²'
+                                else: return '≥900m²'
                             
-                            # Unifica nomes para a legenda
+                            df_grafico['Faixa de Área'] = df_grafico[col_area].apply(classificar_faixa_area)
                             df_grafico['Status'] = df_grafico['Categoria'].apply(lambda x: 'Modernizado' if 'Modernizado' in x else 'Antigo')
                             
                             resumo_grafico = df_grafico.groupby(['Faixa de Área', 'Status'])['R$/m² Terreno'].mean().reset_index()
+                            # FORMATAÇÃO DO TEXTO NA COLUNA
+                            resumo_grafico['Texto_Valor'] = resumo_grafico['R$/m² Terreno'].apply(lambda x: f"R$ {int(x):,}".replace(',', '.') + "/m²")
                             
-                            grafico = alt.Chart(resumo_grafico).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                            ordem_faixas = ['<300m²', '300 a 399m²', '400 a 499m²', '500 a 599m²', '600 a 699m²', '700 a 799m²', '800 a 899m²', '≥900m²']
+                            
+                            # BASE DO GRÁFICO
+                            base = alt.Chart(resumo_grafico).encode(
                                 x=alt.X('Status:N', title=None, axis=alt.Axis(labels=False, ticks=False)),
-                                y=alt.Y('R$/m² Terreno:Q', title='R$/m² de Terreno'),
-                                color=alt.Color('Status:N', scale=alt.Scale(domain=['Antigo', 'Modernizado'], range=['#95a5a6', '#27ae60'])),
-                                column=alt.Column('Faixa de Área:N', title='Faixas de Área Construída', header=alt.Header(labelFontSize=12, labelFontWeight='bold'))
-                            ).properties(width=120, height=350)
+                                y=alt.Y('R$/m² Terreno:Q', title=None, axis=alt.Axis(labels=False, grid=False, ticks=False)),
+                                color=alt.Color('Status:N', scale=alt.Scale(domain=['Antigo', 'Modernizado'], range=['#bdc3c7', '#27ae60']), legend=alt.Legend(title=None, orient="top", labelFontSize=12)),
+                                tooltip=[alt.Tooltip('Faixa de Área:N', title='Área'), alt.Tooltip('Status:N'), alt.Tooltip('Texto_Valor:N', title='Valor Médio')]
+                            ).properties(width=65, height=350)
                             
-                            st.altair_chart(grafico, use_container_width=False)
+                            # COLUNAS AFINADAS E ARREDONDADAS
+                            bars = base.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=24)
+                            
+                            # RÓTULOS P/M² NA VERTICAL
+                            text = base.mark_text(
+                                align='left',
+                                baseline='middle',
+                                dy=-5,
+                                angle=270,
+                                fontSize=11,
+                                fontWeight='bold',
+                                color='#2c3e50'
+                            ).encode(
+                                text='Texto_Valor:N'
+                            )
+                            
+                            # AGRUPAMENTO FINAL LADO A LADO
+                            grafico = alt.layer(bars, text).facet(
+                                column=alt.Column('Faixa de Área:N', title=None, sort=ordem_faixas, header=alt.Header(labelFontSize=12, labelFontWeight='bold', labelOrient='bottom'))
+                            ).configure_view(stroke='transparent')
+                            
+                            st.altair_chart(grafico, use_container_width=True)
                         else:
                             st.info("Não há dados com área de terreno e construção preenchidas suficientes para gerar o gráfico.")
                         
@@ -208,10 +234,10 @@ if rua:
                             df_top5 = df_terreno_valido.sort_values(by='Valor/m² Terreno', ascending=False).head(5).copy()
                             df_top5['Valor/m² Terreno'] = df_top5['Valor/m² Terreno'].apply(formata_moeda)
                             df_top5[col_val] = df_top5[col_val].apply(formata_moeda)
-                            st.dataframe(df_top5.drop(columns=['dist_metros', 'Piso_Faixa', 'Chave_Imovel'], errors='ignore'), use_container_width=True)
+                            st.dataframe(df_top5.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore'), use_container_width=True)
 
                         st.subheader("📋 Planilha Detalhada")
-                        df_visual = df.drop(columns=['dist_metros', 'Piso_Faixa', 'Chave_Imovel'], errors='ignore').copy()
+                        df_visual = df.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore').copy()
                         df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                         st.dataframe(df_visual, use_container_width=True)
                     else:
