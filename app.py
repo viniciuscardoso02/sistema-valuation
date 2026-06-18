@@ -7,6 +7,7 @@ from geopy.geocoders import Nominatim
 from datetime import date
 import altair as alt
 import glob
+import re
 
 # Configuração da página
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
@@ -26,19 +27,36 @@ def formata_moeda(valor):
     except:
         return "-"
 
-# --- NOVO SISTEMA DE LISTAGEM DE BAIRROS (Sem Cache Travado) ---
+def limpar_nome_bairro(nome):
+    if pd.isna(nome): return ""
+    nome = str(nome).upper().strip()
+    # Remove sufixos de estado/cidade comuns no ITBI
+    nome = re.sub(r'\s*-\s*S[AÃ]O PAULO\s*$', '', nome)
+    nome = re.sub(r'\s*-\s*SP\s*$', '', nome)
+    return nome.strip()
+
+# --- NOVO SISTEMA DE MAPEAMENTO DE BAIRROS ---
 @st.cache_data
-def carregar_lista_bairros():
+def obter_mapeamento_bairros():
     try:
         query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
         df = duckdb.query(query).df()
-        bairros_validos = [str(b).strip() for b in df['Bairro'].unique() if pd.notna(b) and str(b).strip() not in ('', '-')]
-        return ["Selecione..."] + sorted(bairros_validos)
+        
+        mapeamento = {}
+        for bairro_original in df['Bairro'].dropna().unique():
+            bairro_limpo = limpar_nome_bairro(bairro_original)
+            if bairro_limpo and bairro_limpo != '-':
+                if bairro_limpo not in mapeamento:
+                    mapeamento[bairro_limpo] = []
+                mapeamento[bairro_limpo].append(bairro_original)
+        
+        bairros_limpos = ["Selecione..."] + sorted(list(mapeamento.keys()))
+        return bairros_limpos, mapeamento
     except Exception as e:
-        st.sidebar.error(f"Aviso: Não foi possível carregar a coluna 'Bairro' ({e})")
-        return ["Selecione..."]
+        st.sidebar.error(f"Aviso: Não foi possível carregar os bairros ({e})")
+        return ["Selecione..."], {}
 
-bairros_disp = carregar_lista_bairros()
+bairros_disp, map_bairros = obter_mapeamento_bairros()
 tipos_disp = ["Residenciais", "Apartamentos"]
 
 # --- BARRA LATERAL ---
@@ -90,8 +108,8 @@ if rua or bairro_alvo != "Selecione...":
         
         try:
             if rua:
-                # Busca Espacial (Geopy + Haversine)
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_v11")
+                # Busca Espacial
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v12")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
@@ -114,11 +132,14 @@ if rua or bairro_alvo != "Selecione...":
                     st.error("Logradouro não encontrado no mapa.")
                     st.stop()
             else:
-                # Busca por Bairro (Ignora Geopy, previne erro com apóstrofos)
-                bairro_sql = bairro_alvo.replace("'", "''")
+                # Busca por Bairro (Utilizando as múltiplas variações sujas mapeadas)
+                variacoes_bairro = map_bairros.get(bairro_alvo, [bairro_alvo])
+                # Formata a lista para o comando SQL IN ('A', 'B', 'C'), tratando aspas simples para não quebrar o SQL
+                variacoes_sql = ", ".join([f"'{v.replace(chr(39), chr(39)+chr(39))}'" for v in variacoes_bairro])
+                
                 query = f"""
                 SELECT * FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true)
-                WHERE Bairro = '{bairro_sql}' {condicao_extra}
+                WHERE Bairro IN ({variacoes_sql}) {condicao_extra}
                 """
                 df_bruto = duckdb.query(query).df()
                 
@@ -143,7 +164,6 @@ if rua or bairro_alvo != "Selecione...":
             df = df.dropna(subset=[col_val, 'Ano_Transacao'])
 
             if not df.empty:
-                # INTELIGÊNCIA DE RETROFIT: Histórico de Variação de Área
                 df['Chave_Imovel'] = df['N° do Cadastro (SQL)'].fillna(df['Nome do Logradouro'] + df['Número'].fillna(''))
                 
                 def classificar_retrofit(grupo):
@@ -162,8 +182,6 @@ if rua or bairro_alvo != "Selecione...":
                     return grupo
                     
                 df = df.groupby('Chave_Imovel', group_keys=False).apply(classificar_retrofit)
-                
-                # Filtro da Janela de Tempo selecionada pelo usuário
                 df = df[(df['Ano_Transacao'] >= ano_min) & (df['Ano_Transacao'] <= ano_max)]
 
                 if not df.empty:
@@ -172,7 +190,6 @@ if rua or bairro_alvo != "Selecione...":
                     idade_media = ano_atual - anos_validos.median() if not anos_validos.empty else None
                     texto_idade = f"{int(idade_media)} anos" if pd.notna(idade_media) else "Sem Registro"
 
-                    # --- PAINEL DE MÉTRICAS (USANDO MEDIANA) ---
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Amostras no Período", len(df))
                     col2.metric("Valor Mediano", formata_moeda(df[col_val].median()))
@@ -181,7 +198,6 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
-                    # --- GRÁFICO: ÁGIO DE MERCADO ---
                     st.subheader("📊 Ágio de Mercado: Modernizadas vs Antigas (Por m² de Terreno)")
                     
                     df_grafico = df.copy()
@@ -205,7 +221,6 @@ if rua or bairro_alvo != "Selecione...":
                         df_grafico['Status'] = df_grafico['Categoria'].apply(lambda x: 'Modernizado' if 'Modernizado' in x else 'Antigo')
                         
                         resumo_grafico = df_grafico.groupby(['Faixa de Área', 'Status'])['R$/m² Terreno'].median().reset_index()
-                        
                         resumo_grafico['Texto_Valor'] = resumo_grafico['R$/m² Terreno'].apply(lambda x: f"R$ {int(x):,}".replace(',', '.') + "/m²")
                         ordem_faixas = ['<300m²', '300 a 399m²', '400 a 499m²', '500 a 599m²', '600 a 699m²', '700 a 799m²', '800 a 899m²', '≥900m²']
                         
@@ -232,7 +247,6 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
-                    # --- MAPA DE LOCALIZAÇÃO OTIMIZADO ---
                     st.subheader("📍 Distribuição Espacial")
                     if rua and lat_c and lon_c:
                         m = folium.Map([lat_c, lon_c], zoom_start=15)
@@ -240,7 +254,6 @@ if rua or bairro_alvo != "Selecione...":
                         folium.Marker([lat_c, lon_c], popup=txt_alvo, icon=folium.Icon(color="red", icon="home")).add_to(m)
                         folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
                     else:
-                        # Se buscou por bairro, calcula o centro do bairro pelas coordenadas retornadas
                         lat_media = df['Latitude'].mean()
                         lon_media = df['Longitude'].mean()
                         m = folium.Map([lat_media, lon_media], zoom_start=14)
@@ -254,7 +267,6 @@ if rua or bairro_alvo != "Selecione...":
                     folium_static(m, width=1200, height=500)
                     st.markdown("---")
                     
-                    # --- TABELAS ---
                     st.subheader("🔝 Top 5 (Valor / m² Terreno)")
                     df_terreno_valido = df[df[col_terr] > 0].copy()
                     if not df_terreno_valido.empty:
