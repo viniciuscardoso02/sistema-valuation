@@ -49,11 +49,11 @@ area_const_alvo = st.sidebar.number_input("Área Construída Alvo (m²)", min_va
 area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_value=0, value=0, step=10)
 
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
-if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
+if rua:
     with st.spinner("A mapear o perímetro espacial e a calcular o Valuation..."):
-        geolocator = Nominatim(user_agent="h2i_valuation_pro_v5")
+        geolocator = Nominatim(user_agent="h2i_valuation_pro_v6")
         
-        # Montagem dinâmica do endereço de geocodificação
+        # Montagem dinâmica do endereço
         endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
         loc = geolocator.geocode(endereco_busca, timeout=10)
         
@@ -63,16 +63,13 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
             # --- CONSTRUÇÃO DINÂMICA DOS FILTROS SQL ---
             filtros_sql = []
             
-            # Filtro de uso do imóvel
             if tipo == "Residenciais":
                 filtros_sql.append("(UPPER(\"Descrição do uso (IPTU)\") LIKE '%RESIDÊN%' OR UPPER(\"Descrição do uso (IPTU)\") LIKE '%CASA%')")
             elif tipo == "Apartamentos":
                 filtros_sql.append("UPPER(\"Descrição do uso (IPTU)\") LIKE '%APARTAMENTO%'")
             
-            # Filtro de período temporal diretamente em SQL
             filtros_sql.append(f"TRY_CAST(REGEXP_EXTRACT(\"Data de Transação\", '(\\d{{4}})') AS INTEGER) BETWEEN {ano_min} AND {ano_max}")
             
-            # Filtros de similaridade de área (Opcionais)
             if area_const_alvo > 0:
                 filtros_sql.append(f"TRY_CAST(\"Área Construída (m2)\" AS FLOAT) BETWEEN {area_const_alvo * 0.75} AND {area_const_alvo * 1.25}")
             if area_terr_alvo > 0:
@@ -80,7 +77,6 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
                 
             condicao_extra = " AND " + " AND ".join(filtros_sql) if filtros_sql else ""
             
-            # Query com processamento de raio geográfico inteligente
             query = f"""
             WITH base_distancia AS (
                 SELECT *,
@@ -101,7 +97,6 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
                 st.stop()
             
             if not df.empty:
-                # --- ALINHAMENTO E LIMPEZA DE TIPAGEM NO PANDAS ---
                 col_val = 'Valor de Transação (declarado pelo contribuinte)'
                 col_area = 'Área Construída (m2)'
                 col_terr = 'Área do Terreno (m2)'
@@ -115,8 +110,6 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
                 df = df.dropna(subset=[col_val])
 
                 if not df.empty:
-                    # --- CORREÇÃO DA IDADE PREDIAL ---
-                    # Desconsidera anos zerados ou irreais vindos da base original
                     ano_atual = date.today().year
                     anos_validos = df[col_ano][(df[col_ano] > 1800) & (df[col_ano] <= ano_atual)]
                     
@@ -135,7 +128,43 @@ if rua:  # APENAS O LOGRADOURO É OBRIGATÓRIO
                     
                     st.markdown("---")
                     
+                    # --- GRÁFICO: ANÁLISE DE VALORIZAÇÃO (MODERNIZADAS VS ANTIGAS) ---
+                    st.subheader("📈 Análise de Valorização: Modernizadas vs Antigas")
+                    st.markdown("Comparativo do prêmio de mercado (Valor/m²) gerado por modernizações/retrofits recentes na região.")
+                    
+                    df_grafico = df.copy()
+                    
+                    # Regra de Classificação de Idade
+                    def classificar_idade(ano):
+                        if pd.isna(ano) or ano <= 1800:
+                            return 'Sem Classificação'
+                        elif ano >= 2018:
+                            return 'Modernizadas (≥ 2018)'
+                        else:
+                            return 'Antigas (< 2018)'
+                            
+                    df_grafico['Categoria'] = df_grafico[col_ano].apply(classificar_idade)
+                    df_grafico = df_grafico[df_grafico['Categoria'] != 'Sem Classificação']
+                    
+                    if not df_grafico.empty:
+                        # Cálculo dos indexadores
+                        df_grafico['R$/m² Construído'] = df_grafico[col_val] / df_grafico[col_area]
+                        df_grafico['R$/m² Terreno'] = df_grafico.apply(
+                            lambda r: r[col_val] / r[col_terr] if pd.notna(r[col_terr]) and r[col_terr] > 0 else None, axis=1
+                        )
+                        
+                        # Agrupamento para o gráfico de barras duplas
+                        resumo_grafico = df_grafico.groupby('Categoria')[['R$/m² Construído', 'R$/m² Terreno']].mean()
+                        
+                        # Renderiza o gráfico nativo do Streamlit
+                        st.bar_chart(resumo_grafico, use_container_width=True)
+                    else:
+                        st.info("Não há dados suficientes com Ano de Construção oficial do GeoSampa neste raio para plotar o comparativo.")
+                    
+                    st.markdown("---")
+                    
                     # --- MAPA DE LOCALIZAÇÃO ---
+                    st.subheader("📍 Distribuição Espacial")
                     m = folium.Map([lat_c, lon_c], zoom_start=15)
                     
                     txt_alvo = f"Alvo: {rua}, {num}" if num else f"Alvo: {rua} (Centro)"
