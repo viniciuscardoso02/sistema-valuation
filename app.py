@@ -7,7 +7,8 @@ from geopy.geocoders import Nominatim
 from datetime import date
 import altair as alt
 import glob
-import re
+import difflib
+import unicodedata
 
 # Configuração da página
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
@@ -27,31 +28,52 @@ def formata_moeda(valor):
     except:
         return "-"
 
-def limpar_nome_bairro(nome):
-    if pd.isna(nome): return ""
-    nome = str(nome).upper().strip()
-    # Remove sufixos de estado/cidade comuns no ITBI
-    nome = re.sub(r'\s*-\s*S[AÃ]O PAULO\s*$', '', nome)
-    nome = re.sub(r'\s*-\s*SP\s*$', '', nome)
-    return nome.strip()
+def remover_acentos(txt):
+    if pd.isna(txt): return ""
+    txt = str(txt).upper().strip()
+    return ''.join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
 
-# --- NOVO SISTEMA DE MAPEAMENTO DE BAIRROS ---
+# --- INTELIGÊNCIA DE AGRUPAMENTO (FUZZY MATCHING) ---
 @st.cache_data
 def obter_mapeamento_bairros():
     try:
         query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
         df = duckdb.query(query).df()
         
-        mapeamento = {}
-        for bairro_original in df['Bairro'].dropna().unique():
-            bairro_limpo = limpar_nome_bairro(bairro_original)
-            if bairro_limpo and bairro_limpo != '-':
-                if bairro_limpo not in mapeamento:
-                    mapeamento[bairro_limpo] = []
-                mapeamento[bairro_limpo].append(bairro_original)
+        bairros_brutos = df['Bairro'].dropna().unique()
         
-        bairros_limpos = ["Selecione..."] + sorted(list(mapeamento.keys()))
-        return bairros_limpos, mapeamento
+        # 1. Limpeza Estrutural Básica
+        map_limpeza_inicial = {}
+        for b in bairros_brutos:
+            if str(b).strip() not in ('', '-', 'NAN', 'NONE'):
+                # Corta hífens e remove acentos
+                limpo = remover_acentos(str(b).split('-')[0])
+                if limpo:
+                    if limpo not in map_limpeza_inicial:
+                        map_limpeza_inicial[limpo] = []
+                    map_limpeza_inicial[limpo].append(b)
+
+        # 2. Motor de Similaridade (Agrupa "A DE PINHEIROS" com "ALTO DE PINHEIROS")
+        bairros_unicos_limpos = list(map_limpeza_inicial.keys())
+        # Ordena pelo tamanho: os nomes mais completos viram o "Padrão Oficial"
+        bairros_unicos_limpos.sort(key=len, reverse=True)
+        
+        bairros_canonicos = []
+        agrupamentos = {}
+        
+        for b_limpo in bairros_unicos_limpos:
+            # Procura um bairro já registrado que seja 82% idêntico na escrita
+            matches = difflib.get_close_matches(b_limpo, bairros_canonicos, n=1, cutoff=0.82)
+            
+            if matches:
+                canonico = matches[0]
+                agrupamentos[canonico].extend(map_limpeza_inicial[b_limpo])
+            else:
+                bairros_canonicos.append(b_limpo)
+                agrupamentos[b_limpo] = map_limpeza_inicial[b_limpo]
+                
+        bairros_finais = ["Selecione..."] + sorted(list(agrupamentos.keys()))
+        return bairros_finais, agrupamentos
     except Exception as e:
         st.sidebar.error(f"Aviso: Não foi possível carregar os bairros ({e})")
         return ["Selecione..."], {}
@@ -86,9 +108,8 @@ area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_valu
 
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
 if rua or bairro_alvo != "Selecione...":
-    with st.spinner("A processar inteligência de mercado..."):
+    with st.spinner("A processar inteligência de mercado e similaridade de bairros..."):
         
-        # 1. CONSTRUÇÃO DOS FILTROS SQL GERAIS
         filtros_sql = []
         if tipo == "Residenciais":
             filtros_sql.append("(UPPER(\"Descrição do uso (IPTU)\") LIKE '%RESIDÊN%' OR UPPER(\"Descrição do uso (IPTU)\") LIKE '%CASA%')")
@@ -102,14 +123,12 @@ if rua or bairro_alvo != "Selecione...":
             
         condicao_extra = " AND " + " AND ".join(filtros_sql) if filtros_sql else ""
         
-        # 2. ROTEAMENTO DE BUSCA (RAIO VS BAIRRO)
         df_bruto = pd.DataFrame()
         lat_c, lon_c = None, None
         
         try:
             if rua:
-                # Busca Espacial
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_v12")
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v14")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
@@ -132,9 +151,8 @@ if rua or bairro_alvo != "Selecione...":
                     st.error("Logradouro não encontrado no mapa.")
                     st.stop()
             else:
-                # Busca por Bairro (Utilizando as múltiplas variações sujas mapeadas)
+                # O motor agora busca por todas as dezenas de variações semânticas que ele agrupou
                 variacoes_bairro = map_bairros.get(bairro_alvo, [bairro_alvo])
-                # Formata a lista para o comando SQL IN ('A', 'B', 'C'), tratando aspas simples para não quebrar o SQL
                 variacoes_sql = ", ".join([f"'{v.replace(chr(39), chr(39)+chr(39))}'" for v in variacoes_bairro])
                 
                 query = f"""
@@ -147,7 +165,6 @@ if rua or bairro_alvo != "Selecione...":
             st.error(f"Falha técnica na consulta: {e}")
             st.stop()
             
-        # 3. PROCESSAMENTO DE DADOS E VALUATION
         if not df_bruto.empty:
             df = df_bruto.copy()
             col_val = 'Valor de Transação (declarado pelo contribuinte)'
@@ -164,6 +181,13 @@ if rua or bairro_alvo != "Selecione...":
             df = df.dropna(subset=[col_val, 'Ano_Transacao'])
 
             if not df.empty:
+                # Padroniza a exibição da tabela baseando-se no nome que o Fuzzy Matching elegeu como oficial
+                if bairro_alvo != "Selecione...":
+                    df['Bairro'] = bairro_alvo
+                else:
+                    # Para buscas por raio, unifica o visual também usando a chave do mapeamento inverso (simplificado)
+                    df['Bairro'] = df['Bairro'].apply(lambda x: remover_acentos(str(x).split('-')[0]))
+
                 df['Chave_Imovel'] = df['N° do Cadastro (SQL)'].fillna(df['Nome do Logradouro'] + df['Número'].fillna(''))
                 
                 def classificar_retrofit(grupo):
