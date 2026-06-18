@@ -42,29 +42,23 @@ def obter_mapeamento_bairros():
         
         bairros_brutos = df['Bairro'].dropna().unique()
         
-        # 1. Limpeza Estrutural Básica
         map_limpeza_inicial = {}
         for b in bairros_brutos:
             if str(b).strip() not in ('', '-', 'NAN', 'NONE'):
-                # Corta hífens e remove acentos
                 limpo = remover_acentos(str(b).split('-')[0])
                 if limpo:
                     if limpo not in map_limpeza_inicial:
                         map_limpeza_inicial[limpo] = []
                     map_limpeza_inicial[limpo].append(b)
 
-        # 2. Motor de Similaridade (Agrupa "A DE PINHEIROS" com "ALTO DE PINHEIROS")
         bairros_unicos_limpos = list(map_limpeza_inicial.keys())
-        # Ordena pelo tamanho: os nomes mais completos viram o "Padrão Oficial"
         bairros_unicos_limpos.sort(key=len, reverse=True)
         
         bairros_canonicos = []
         agrupamentos = {}
         
         for b_limpo in bairros_unicos_limpos:
-            # Procura um bairro já registrado que seja 82% idêntico na escrita
             matches = difflib.get_close_matches(b_limpo, bairros_canonicos, n=1, cutoff=0.82)
-            
             if matches:
                 canonico = matches[0]
                 agrupamentos[canonico].extend(map_limpeza_inicial[b_limpo])
@@ -106,9 +100,13 @@ st.sidebar.header("📐 Dimensões do Alvo (Opcional)")
 area_const_alvo = st.sidebar.number_input("Área Construída Alvo (m²)", min_value=0, value=0, step=10)
 area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_value=0, value=0, step=10)
 
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Configurações Avançadas")
+remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True, help="Remove imóveis com valores de R$/m² fora do padrão estatístico normal da região, evitando distorções causadas por erros de cartório.")
+
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
 if rua or bairro_alvo != "Selecione...":
-    with st.spinner("A processar inteligência de mercado e similaridade de bairros..."):
+    with st.spinner("A processar inteligência de mercado..."):
         
         filtros_sql = []
         if tipo == "Residenciais":
@@ -128,7 +126,7 @@ if rua or bairro_alvo != "Selecione...":
         
         try:
             if rua:
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_v14")
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v15")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
@@ -151,7 +149,6 @@ if rua or bairro_alvo != "Selecione...":
                     st.error("Logradouro não encontrado no mapa.")
                     st.stop()
             else:
-                # O motor agora busca por todas as dezenas de variações semânticas que ele agrupou
                 variacoes_bairro = map_bairros.get(bairro_alvo, [bairro_alvo])
                 variacoes_sql = ", ".join([f"'{v.replace(chr(39), chr(39)+chr(39))}'" for v in variacoes_bairro])
                 
@@ -178,14 +175,23 @@ if rua or bairro_alvo != "Selecione...":
             df[col_ano] = pd.to_numeric(df[col_ano], errors='coerce')
             df['Ano_Transacao'] = df['Data de Transação'].astype(str).str.extract(r'(\d{4})').astype(float)
             
-            df = df.dropna(subset=[col_val, 'Ano_Transacao'])
+            df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
+
+            # --- FILTRO DE OUTLIERS ---
+            if remover_outliers and not df.empty:
+                df['Preco_m2_Construido'] = df[col_val] / df[col_area]
+                Q1 = df['Preco_m2_Construido'].quantile(0.25)
+                Q3 = df['Preco_m2_Construido'].quantile(0.75)
+                IQR = Q3 - Q1
+                limite_inf = Q1 - 1.5 * IQR
+                limite_sup = Q3 + 1.5 * IQR
+                df = df[(df['Preco_m2_Construido'] >= limite_inf) & (df['Preco_m2_Construido'] <= limite_sup)]
+                df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
-                # Padroniza a exibição da tabela baseando-se no nome que o Fuzzy Matching elegeu como oficial
                 if bairro_alvo != "Selecione...":
                     df['Bairro'] = bairro_alvo
                 else:
-                    # Para buscas por raio, unifica o visual também usando a chave do mapeamento inverso (simplificado)
                     df['Bairro'] = df['Bairro'].apply(lambda x: remover_acentos(str(x).split('-')[0]))
 
                 df['Chave_Imovel'] = df['N° do Cadastro (SQL)'].fillna(df['Nome do Logradouro'] + df['Número'].fillna(''))
@@ -271,16 +277,28 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
+                    # --- MAPA DE LOCALIZAÇÃO (AGORA COM GOOGLE MAPS) ---
                     st.subheader("📍 Distribuição Espacial")
                     if rua and lat_c and lon_c:
-                        m = folium.Map([lat_c, lon_c], zoom_start=15)
+                        m = folium.Map([lat_c, lon_c], zoom_start=15, tiles=None)
+                        folium.TileLayer(
+                            tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+                            attr='Google Maps',
+                            name='Google Maps'
+                        ).add_to(m)
+                        
                         txt_alvo = f"Alvo: {rua}, {num}" if num else f"Alvo: {rua} (Centro)"
                         folium.Marker([lat_c, lon_c], popup=txt_alvo, icon=folium.Icon(color="red", icon="home")).add_to(m)
                         folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
                     else:
                         lat_media = df['Latitude'].mean()
                         lon_media = df['Longitude'].mean()
-                        m = folium.Map([lat_media, lon_media], zoom_start=14)
+                        m = folium.Map([lat_media, lon_media], zoom_start=14, tiles=None)
+                        folium.TileLayer(
+                            tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+                            attr='Google Maps',
+                            name='Google Maps'
+                        ).add_to(m)
                         
                     for _, r in df.iterrows():
                         if pd.notna(r['Latitude']) and pd.notna(r['Longitude']):
@@ -307,7 +325,7 @@ if rua or bairro_alvo != "Selecione...":
                 else:
                     st.warning(f"Existem transações, mas nenhuma dentro da janela de anos ({ano_min}-{ano_max}).")
             else:
-                st.warning("Imóveis identificados não possuem registros financeiros.")
+                st.warning("Imóveis identificados não possuem registros financeiros após o filtro de outliers.")
         else:
             st.warning("Nenhum comparável localizado para as especificações digitadas.")
 else:
