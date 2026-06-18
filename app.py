@@ -5,6 +5,7 @@ import folium
 from streamlit_folium import folium_static
 from geopy.geocoders import Nominatim
 from datetime import date
+import altair as alt
 import glob
 
 # Configuração da página corporativa
@@ -35,7 +36,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("🎯 Filtros de Ativo")
 tipo = st.sidebar.selectbox("Uso do Imóvel", ["Residenciais", "Apartamentos"])
 
-# Filtro temporal preservado para consistência de mercado
+# Filtro temporal
 ano_min, ano_max = st.sidebar.slider(
     "Ano da Transação", 
     min_value=2010, 
@@ -51,9 +52,8 @@ area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_valu
 # --- MOTOR DE EXECUÇÃO OTIMIZADO ---
 if rua:
     with st.spinner("A mapear o perímetro espacial e a calcular o Valuation..."):
-        geolocator = Nominatim(user_agent="h2i_valuation_pro_v6")
+        geolocator = Nominatim(user_agent="h2i_valuation_pro_v7")
         
-        # Montagem dinâmica do endereço
         endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
         loc = geolocator.geocode(endereco_busca, timeout=10)
         
@@ -128,13 +128,13 @@ if rua:
                     
                     st.markdown("---")
                     
-                    # --- GRÁFICO: ANÁLISE DE VALORIZAÇÃO (MODERNIZADAS VS ANTIGAS) ---
-                    st.subheader("📈 Análise de Valorização: Modernizadas vs Antigas")
-                    st.markdown("Comparativo do prêmio de mercado (Valor/m²) gerado por modernizações/retrofits recentes na região.")
+                    # --- GRÁFICO: ANÁLISE DE VALORIZAÇÃO (COLUNAS DUPLAS NO ALTAIR) ---
+                    st.subheader("📊 Comparativo de Valorização: Modernizadas vs Antigas")
+                    st.markdown("Análise do prêmio de mercado (R$/m²) gerado por modernizações recentes na região.")
                     
                     df_grafico = df.copy()
                     
-                    # Regra de Classificação de Idade
+                    # Regra de Classificação
                     def classificar_idade(ano):
                         if pd.isna(ano) or ano <= 1800:
                             return 'Sem Classificação'
@@ -147,19 +147,26 @@ if rua:
                     df_grafico = df_grafico[df_grafico['Categoria'] != 'Sem Classificação']
                     
                     if not df_grafico.empty:
-                        # Cálculo dos indexadores
                         df_grafico['R$/m² Construído'] = df_grafico[col_val] / df_grafico[col_area]
                         df_grafico['R$/m² Terreno'] = df_grafico.apply(
                             lambda r: r[col_val] / r[col_terr] if pd.notna(r[col_terr]) and r[col_terr] > 0 else None, axis=1
                         )
                         
-                        # Agrupamento para o gráfico de barras duplas
-                        resumo_grafico = df_grafico.groupby('Categoria')[['R$/m² Construído', 'R$/m² Terreno']].mean()
+                        # Prepara os dados para o Altair (Colunas Lado a Lado)
+                        resumo_grafico = df_grafico.groupby('Categoria')[['R$/m² Construído', 'R$/m² Terreno']].mean().reset_index()
+                        df_melted = resumo_grafico.melt(id_vars='Categoria', var_name='Métrica', value_name='Valor (R$)')
                         
-                        # Renderiza o gráfico nativo do Streamlit
-                        st.bar_chart(resumo_grafico, use_container_width=True)
+                        # Construção do Gráfico Agrupado
+                        grafico_colunas = alt.Chart(df_melted).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                            x=alt.X('Categoria:N', title=None, axis=alt.Axis(labels=False, ticks=False)),
+                            y=alt.Y('Valor (R$):Q', title='Valor Médio (R$/m²)'),
+                            color=alt.Color('Categoria:N', title='Safra do Imóvel', scale=alt.Scale(domain=['Antigas (< 2018)', 'Modernizadas (≥ 2018)'], range=['#7f8c8d', '#2ecc71'])),
+                            column=alt.Column('Métrica:N', title=None, header=alt.Header(labelFontSize=13, labelFontWeight='bold'))
+                        ).properties(width=300, height=350)
+                        
+                        st.altair_chart(grafico_colunas, use_container_width=False)
                     else:
-                        st.info("Não há dados suficientes com Ano de Construção oficial do GeoSampa neste raio para plotar o comparativo.")
+                        st.info("Não há dados oficiais de idade suficientes neste raio para plotar o comparativo.")
                     
                     st.markdown("---")
                     
