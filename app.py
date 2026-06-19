@@ -9,6 +9,7 @@ import altair as alt
 import glob
 import unicodedata
 import numpy as np
+import re
 
 # Configuração da página corporativa
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
@@ -17,10 +18,10 @@ st.title("🏢 Sistema de Valuation Inteligente - Home 2 Invest")
 # --- VERIFICAÇÃO DE DADOS HIGIENIZADOS ---
 arquivos_parquet = glob.glob('base_itbi_limpa_*.parquet')
 if not arquivos_parquet:
-    st.error("Erro Crítico: Os arquivos fatiados 'base_itbi_limpa_*.parquet' não foram encontrados na raiz do repositório.")
+    st.error("Erro Crítico: Os arquivos fatiados não foram encontrados na raiz do repositório.")
     st.stop()
 
-# --- FUNÇÕES DE APOIO ---
+# --- FUNÇÕES DE APOIO E LIMPEZA ---
 def formata_moeda(valor):
     try:
         if pd.isna(valor): return "-"
@@ -33,28 +34,30 @@ def remover_acentos(txt):
     txt = str(txt).upper().strip()
     return ''.join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
 
-# --- CARREGAMENTO INSTANTÂNEO DE BAIRROS (CORRIGIDO) ---
+def extrair_palavra_chave_rua(nome_rua):
+    """Extrai o núcleo do nome da rua para burlar a sujeira do cartório."""
+    rua_limpa = remover_acentos(nome_rua)
+    termos_ignorados = ['RUA', 'AVENIDA', 'AV', 'ALAMEDA', 'TRAVESSA', 'PRAÇA', 'RODOVIA', 'DOS', 'DAS', 'DE', 'DO', 'DA', 'PROFESSOR', 'DR', 'DOUTOR']
+    palavras = rua_limpa.split()
+    palavras_uteis = [p for p in palavras if p not in termos_ignorados and len(p) > 2]
+    return palavras_uteis[-1] if palavras_uteis else rua_limpa.split()[0]
+
+# --- CARREGAMENTO DE BAIRROS ---
 @st.cache_data
 def carregar_lista_bairros():
     try:
-        # O parâmetro union_by_name=true é essencial ao ler múltiplos arquivos
         query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
         df_b = duckdb.query(query).df()
         return ["Selecione..."] + sorted(df_b['Bairro'].astype(str).unique())
-    except Exception as e:
-        # Plano B: Carregamento infalível via Pandas se o DuckDB travar
-        bairros = set()
-        for f in arquivos_parquet:
-            df_temp = pd.read_parquet(f, columns=['Bairro'])
-            bairros.update(df_temp['Bairro'].dropna().astype(str).unique())
-        return ["Selecione..."] + sorted(list(bairros))
+    except Exception:
+        return ["Selecione..."]
 
 bairros_disp = carregar_lista_bairros()
 tipos_disp = ["Residenciais", "Apartamentos"]
 
 # --- BARRA LATERAL ---
 st.sidebar.header("📍 Parâmetros de Busca")
-rua = st.sidebar.text_input("Logradouro (Para busca por Raio)")
+rua = st.sidebar.text_input("Logradouro (Validação em Tempo Real)")
 num = st.sidebar.text_input("Número (Opcional)")
 raio = st.sidebar.slider("Raio de busca (metros)", 100, 2500, 500)
 
@@ -65,12 +68,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("🎯 Filtros de Ativo")
 tipo = st.sidebar.selectbox("Uso do Imóvel", tipos_disp)
 
-ano_min, ano_max = st.sidebar.slider(
-    "Ano da Transação", 
-    min_value=2010, 
-    max_value=date.today().year, 
-    value=(2020, date.today().year)
-)
+ano_min, ano_max = st.sidebar.slider("Ano da Transação", min_value=2010, max_value=date.today().year, value=(2020, date.today().year))
 
 st.sidebar.markdown("---")
 st.sidebar.header("📐 Dimensões do Alvo (Opcional)")
@@ -81,17 +79,16 @@ st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
 remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
 
-# --- VERIFICAÇÃO DE ESTRUTURA BLINDADA ---
+# --- VERIFICAÇÃO DE COORDENADAS NA BASE ---
 try:
     amostra_cols = duckdb.query("SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true) LIMIT 1").df().columns
     tem_lat_lon = 'Latitude' in amostra_cols and 'Longitude' in amostra_cols
 except:
-    amostra_cols = pd.read_parquet(arquivos_parquet[0]).columns
-    tem_lat_lon = 'Latitude' in amostra_cols and 'Longitude' in amostra_cols
+    tem_lat_lon = False
 
 # --- MOTOR DE EXECUÇÃO ---
 if rua or bairro_alvo != "Selecione...":
-    with st.spinner("A processar inteligência de mercado de alta velocidade..."):
+    with st.spinner("A processar inteligência de mercado integrada a mapas..."):
         
         filtros_sql = []
         if tipo == "Residenciais":
@@ -108,34 +105,46 @@ if rua or bairro_alvo != "Selecione...":
         
         df_bruto = pd.DataFrame()
         lat_c, lon_c = None, None
+        nome_rua_oficial = rua
         
         try:
             if rua:
-                if not tem_lat_lon:
-                    st.warning("⚠️ A busca por raio está indisponível porque a base não possui coordenadas geográficas cadastradas. Use a busca por Bairro.")
-                    st.stop()
-
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_final")
+                # 1. VALIDAÇÃO INTELIGENTE DA RUA (API NOMINATIM)
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v19")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
                 if loc:
                     lat_c, lon_c = loc.latitude, loc.longitude
-                    query = f"""
-                    WITH base_distancia AS (
-                        SELECT *,
-                        (6371000 * acos(
-                            cos(radians({lat_c})) * cos(radians(Latitude)) * cos(radians(Longitude) - radians({lon_c})) + 
-                            sin(radians({lat_c})) * sin(radians(Latitude))
-                        )) as dist_metros
-                        FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
-                        WHERE Latitude IS NOT NULL {condicao_extra}
-                    )
-                    SELECT * FROM base_distancia WHERE dist_metros <= {raio}
-                    """
-                    df_bruto = duckdb.query(query).df()
+                    nome_rua_oficial = loc.address.split(',')[0] # Extrai o nome padronizado pela API
+                    st.success(f"📍 Mapa identificou: **{nome_rua_oficial}**")
+                    
+                    if tem_lat_lon:
+                        # Busca por Raio Matemático (Se a base tiver coordenadas)
+                        query = f"""
+                        WITH base_distancia AS (
+                            SELECT *,
+                            (6371000 * acos(
+                                cos(radians({lat_c})) * cos(radians(Latitude)) * cos(radians(Longitude) - radians({lon_c})) + 
+                                sin(radians({lat_c})) * sin(radians(Latitude))
+                            )) as dist_metros
+                            FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
+                            WHERE Latitude IS NOT NULL {condicao_extra}
+                        )
+                        SELECT * FROM base_distancia WHERE dist_metros <= {raio}
+                        """
+                        df_bruto = duckdb.query(query).df()
+                    else:
+                        # Busca por Similaridade Textual (Fallback blindado caso falte coordenada)
+                        palavra_chave = extrair_palavra_chave_rua(rua)
+                        st.info(f"Coordenadas ausentes na base. Buscando transações vinculadas à chave: '{palavra_chave}'")
+                        query = f"""
+                        SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
+                        WHERE UPPER("Nome do Logradouro") LIKE '%{palavra_chave}%' {condicao_extra}
+                        """
+                        df_bruto = duckdb.query(query).df()
                 else:
-                    st.error("Logradouro não encontrado no mapa.")
+                    st.error("Logradouro não encontrado no mapa oficial. Tente verificar a grafia.")
                     st.stop()
             else:
                 bairro_sql = bairro_alvo.replace("'", "''")
@@ -146,28 +155,8 @@ if rua or bairro_alvo != "Selecione...":
                 df_bruto = duckdb.query(query).df()
                 
         except Exception as e:
-            # Plano B: Fallback infalível ativado
-            dfs_fallback = [pd.read_parquet(f) for f in arquivos_parquet]
-            df_completo = pd.concat(dfs_fallback, ignore_index=True)
-            
-            if rua and lat_c and lon_c:
-                lat1, lon1 = np.radians(lat_c), np.radians(lon_c)
-                lat2, lon2 = np.radians(df_completo['Latitude']), np.radians(df_completo['Longitude'])
-                a = np.sin((lat2 - lat1)/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1)/2)**2
-                df_completo['dist_metros'] = 6371000 * (2 * np.arcsin(np.sqrt(a)))
-                df_bruto = df_completo[df_completo['dist_metros'] <= raio].copy()
-            else:
-                df_bruto = df_completo[df_completo['Bairro'] == bairro_alvo].copy()
-
-            if tipo == "Residenciais":
-                df_bruto = df_bruto[df_bruto['Descrição do uso (IPTU)'].str.contains('RESIDÊN|CASA', case=False, na=False)]
-            elif tipo == "Apartamentos":
-                df_bruto = df_bruto[df_bruto['Descrição do uso (IPTU)'].str.contains('APARTAMENTO', case=False, na=False)]
-            
-            if area_const_alvo > 0:
-                df_bruto = df_bruto[(df_bruto['Área Construída (m2)'] >= area_const_alvo * 0.75) & (df_bruto['Área Construída (m2)'] <= area_const_alvo * 1.25)]
-            if area_terr_alvo > 0:
-                df_bruto = df_bruto[(df_bruto['Área do Terreno (m2)'] >= area_terr_alvo * 0.75) & (df_bruto['Área do Terreno (m2)'] <= area_terr_alvo * 1.25)]
+            st.error(f"Falha técnica na consulta estrutural: {e}")
+            st.stop()
             
         if not df_bruto.empty:
             df = df_bruto.copy()
@@ -183,11 +172,15 @@ if rua or bairro_alvo != "Selecione...":
                     df[c] = pd.NA
             
             if 'Ano_Transacao' not in df.columns:
-                st.error("Erro na leitura temporal. Contate o administrador.")
-                st.stop()
+                if 'Data de Transação' in df.columns:
+                    df['Ano_Transacao'] = df['Data de Transação'].astype(str).str.extract(r'(\d{4})').astype(float)
+                else:
+                    st.error("Coluna temporal não encontrada. O Dashboard não pode prosseguir.")
+                    st.stop()
 
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
 
+            # Outliers
             if remover_outliers and not df.empty:
                 df['Preco_m2_Construido'] = df[col_val] / df[col_area]
                 Q1 = df['Preco_m2_Construido'].quantile(0.25)
@@ -197,6 +190,7 @@ if rua or bairro_alvo != "Selecione...":
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
+                # Motor de Retrofit
                 chave_col = 'N° do Cadastro (SQL)' if 'N° do Cadastro (SQL)' in df.columns else 'Nome do Logradouro'
                 df['Chave_Imovel'] = df[chave_col].astype(str) + df.get('Número', '').astype(str)
                 
@@ -223,7 +217,7 @@ if rua or bairro_alvo != "Selecione...":
                     texto_idade = f"{int(idade_media)} anos" if pd.notna(idade_media) else "Sem Registro"
 
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Amostras no Período", len(df))
+                    col1.metric("Amostras na Rua/Raio", len(df))
                     col2.metric("Valor Mediano", formata_moeda(df[col_val].median()))
                     col3.metric("Mediana / m² Construído", formata_moeda((df[col_val] / df[col_area]).median()))
                     col4.metric("Idade Mediana Predial", texto_idade)
@@ -267,8 +261,6 @@ if rua or bairro_alvo != "Selecione...":
                             
                             grafico = alt.layer(bars, text).facet(column=alt.Column('Faixa de Área:N', title=None, sort=ordem_faixas, header=alt.Header(labelFontSize=12, labelFontWeight='bold', labelOrient='bottom'))).configure_view(stroke='transparent')
                             st.altair_chart(grafico, use_container_width=True)
-                    else:
-                        st.warning("Coluna de Área do Terreno não localizada.")
                     
                     st.markdown("---")
                     
@@ -291,8 +283,9 @@ if rua or bairro_alvo != "Selecione...":
                     folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
                     
                     if rua and lat_c and lon_c:
-                        folium.Marker([lat_c, lon_c], popup=f"Alvo: {rua}", icon=folium.Icon(color="red", icon="home")).add_to(m)
-                        folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
+                        folium.Marker([lat_c, lon_c], popup=f"Alvo Verificado: {nome_rua_oficial}", icon=folium.Icon(color="red", icon="home")).add_to(m)
+                        if tem_lat_lon:
+                            folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
                         
                     if tem_coords_validas:
                         for _, r in df.iterrows():
@@ -301,30 +294,20 @@ if rua or bairro_alvo != "Selecione...":
                                 popup_txt = f"<b>{r.get('Categoria', '')}</b><br>{r.get('Nome do Logradouro', '')}<br>Valor: {formata_moeda(r.get(col_val))}<br>Área: {r.get(col_area)}m²"
                                 folium.CircleMarker([r[col_lat], r[col_lon]], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
                     else:
-                        st.info("ℹ️ Os imóveis encontrados nesta busca não possuem coordenadas (Latitude/Longitude) cadastradas.")
+                        st.info("ℹ️ Os lotes encontrados nesta busca possuem o endereço correto, mas o cartório não disponibilizou as coordenadas de latitude/longitude para a plotagem dos pinos individuais no mapa.")
                     
                     folium_static(m, width=1200, height=500)
                     
                     st.markdown("---")
-                    st.subheader("🔝 Top 5 (Valor / m² Terreno)")
-                    if col_terr in df.columns:
-                        df_terreno_valido = df[df[col_terr] > 0].copy()
-                        if not df_terreno_valido.empty:
-                            df_terreno_valido['Valor/m² Terreno'] = df_terreno_valido[col_val] / df_terreno_valido[col_terr]
-                            df_top5 = df_terreno_valido.sort_values(by='Valor/m² Terreno', ascending=False).head(5).copy()
-                            df_top5['Valor/m² Terreno'] = df_top5['Valor/m² Terreno'].apply(formata_moeda)
-                            df_top5[col_val] = df_top5[col_val].apply(formata_moeda)
-                            st.dataframe(df_top5.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore'), use_container_width=True)
-
-                    st.subheader("📋 Planilha Detalhada")
+                    st.subheader("📋 Planilha de Comparáveis na Região")
                     df_visual = df.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore').copy()
                     df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                     st.dataframe(df_visual, use_container_width=True)
                 else:
-                    st.warning("Sem transações na janela de tempo selecionada.")
+                    st.warning("Sem transações para esse local na janela de tempo selecionada.")
             else:
-                st.warning("Nenhum imóvel restou após o filtro de outliers.")
+                st.warning("Nenhum imóvel restou após o filtro de discrepâncias (Outliers).")
         else:
-            st.warning("Nenhum comparável localizado.")
+            st.warning("Nenhum comparável localizado para este endereço na base de dados.")
 else:
-    st.info("👈 Indique um Logradouro ou selecione um Bairro para iniciar.")
+    st.info("👈 Digite o endereço do projeto ou selecione um bairro para iniciar a análise de Valuation.")
