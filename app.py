@@ -9,8 +9,9 @@ import altair as alt
 import glob
 import difflib
 import unicodedata
+import numpy as np
 
-# Configuração da página
+# Configuração da página corporativa
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
 st.title("🏢 Sistema de Valuation Inteligente - Home 2 Invest")
 
@@ -35,7 +36,7 @@ def remover_acentos(txt):
 
 # --- INTELIGÊNCIA DE AGRUPAMENTO (FUZZY MATCHING) ---
 @st.cache_data
-def obter_mapeamento_bairros():
+def obtener_mapeamento_bairros():
     try:
         query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
         df = duckdb.query(query).df()
@@ -72,7 +73,7 @@ def obter_mapeamento_bairros():
         st.sidebar.error(f"Aviso: Não foi possível carregar os bairros ({e})")
         return ["Selecione..."], {}
 
-bairros_disp, map_bairros = obter_mapeamento_bairros()
+bairros_disp, map_bairros = obtener_mapeamento_bairros()
 tipos_disp = ["Residenciais", "Apartamentos"]
 
 # --- BARRA LATERAL ---
@@ -102,11 +103,11 @@ area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_valu
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
-remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True, help="Remove imóveis com valores de R$/m² fora do padrão estatístico normal da região, evitando distorções causadas por erros de cartório.")
+remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True, help="Remove registros com R$/m² fora da curva normal da região.")
 
-# --- MOTOR DE EXECUÇÃO OTIMIZADO ---
+# --- MOTOR DE EXECUÇÃO ULTRA-RÁPIDO ---
 if rua or bairro_alvo != "Selecione...":
-    with st.spinner("A processar inteligência de mercado..."):
+    with st.spinner("A processar inteligência de mercado de alta velocidade..."):
         
         filtros_sql = []
         if tipo == "Residenciais":
@@ -126,7 +127,7 @@ if rua or bairro_alvo != "Selecione...":
         
         try:
             if rua:
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_v15")
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v16")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
@@ -177,15 +178,13 @@ if rua or bairro_alvo != "Selecione...":
             
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
 
-            # --- FILTRO DE OUTLIERS ---
+            # --- FILTRO DE OUTLIERS (IQR) ---
             if remover_outliers and not df.empty:
                 df['Preco_m2_Construido'] = df[col_val] / df[col_area]
                 Q1 = df['Preco_m2_Construido'].quantile(0.25)
                 Q3 = df['Preco_m2_Construido'].quantile(0.75)
                 IQR = Q3 - Q1
-                limite_inf = Q1 - 1.5 * IQR
-                limite_sup = Q3 + 1.5 * IQR
-                df = df[(df['Preco_m2_Construido'] >= limite_inf) & (df['Preco_m2_Construido'] <= limite_sup)]
+                df = df[(df['Preco_m2_Construido'] >= (Q1 - 1.5 * IQR)) & (df['Preco_m2_Construido'] <= (Q3 + 1.5 * IQR))]
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
@@ -194,24 +193,26 @@ if rua or bairro_alvo != "Selecione...":
                 else:
                     df['Bairro'] = df['Bairro'].apply(lambda x: remover_acentos(str(x).split('-')[0]))
 
+                # --- NOVO MOTOR VETORIZADO DE INTELIGÊNCIA DE RETROFIT (SEM LOOP / SEM APPLY) ---
                 df['Chave_Imovel'] = df['N° do Cadastro (SQL)'].fillna(df['Nome do Logradouro'] + df['Número'].fillna(''))
                 
-                def classificar_retrofit(grupo):
-                    areas_unicas = grupo[col_area].dropna().unique()
-                    houve_expansao = len(areas_unicas) > 1 and (max(areas_unicas) - min(areas_unicas)) > 10
-                    
-                    categorias = []
-                    for _, row in grupo.iterrows():
-                        if pd.notna(row[col_ano]) and row[col_ano] >= 2018:
-                            categorias.append('Modernizado (≥ 2018)')
-                        elif houve_expansao and row[col_area] == max(areas_unicas):
-                            categorias.append('Modernizado (Retrofit)')
-                        else:
-                            categorias.append('Antigo')
-                    grupo['Categoria'] = categorias
-                    return grupo
-                    
-                df = df.groupby('Chave_Imovel', group_keys=False).apply(classificar_retrofit)
+                df['Max_Area_Historica'] = df.groupby('Chave_Imovel')[col_area].transform('max')
+                df['Min_Area_Historica'] = df.groupby('Chave_Imovel')[col_area].transform('min')
+                df['Qtd_Areas_Unicas'] = df.groupby('Chave_Imovel')[col_area].transform('nunique')
+
+                df['Houve_Expansao'] = (df['Qtd_Areas_Unicas'] > 1) & ((df['Max_Area_Historica'] - df['Min_Area_Historica']) > 10)
+
+                condicoes = [
+                    (df[col_ano] >= 2018),
+                    (df['Houve_Expansao'] & (df[col_area] == df['Max_Area_Historica']))
+                ]
+                escolhas = ['Modernizado (≥ 2018)', 'Modernizado (Retrofit)']
+                df['Categoria'] = np.select(condicoes, escolhas, default='Antigo')
+
+                # Limpeza de colunas auxiliares de memória
+                df = df.drop(columns=['Max_Area_Historica', 'Min_Area_Historica', 'Qtd_Areas_Unicas', 'Houve_Expansao'])
+                
+                # Aplicação da janela temporal selecionada
                 df = df[(df['Ano_Transacao'] >= ano_min) & (df['Ano_Transacao'] <= ano_max)]
 
                 if not df.empty:
@@ -277,16 +278,10 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
-                    # --- MAPA DE LOCALIZAÇÃO (AGORA COM GOOGLE MAPS) ---
                     st.subheader("📍 Distribuição Espacial")
                     if rua and lat_c and lon_c:
                         m = folium.Map([lat_c, lon_c], zoom_start=15, tiles=None)
-                        folium.TileLayer(
-                            tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
-                            attr='Google Maps',
-                            name='Google Maps'
-                        ).add_to(m)
-                        
+                        folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
                         txt_alvo = f"Alvo: {rua}, {num}" if num else f"Alvo: {rua} (Centro)"
                         folium.Marker([lat_c, lon_c], popup=txt_alvo, icon=folium.Icon(color="red", icon="home")).add_to(m)
                         folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
@@ -294,11 +289,7 @@ if rua or bairro_alvo != "Selecione...":
                         lat_media = df['Latitude'].mean()
                         lon_media = df['Longitude'].mean()
                         m = folium.Map([lat_media, lon_media], zoom_start=14, tiles=None)
-                        folium.TileLayer(
-                            tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
-                            attr='Google Maps',
-                            name='Google Maps'
-                        ).add_to(m)
+                        folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
                         
                     for _, r in df.iterrows():
                         if pd.notna(r['Latitude']) and pd.notna(r['Longitude']):
