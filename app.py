@@ -141,8 +141,7 @@ if rua or bairro_alvo != "Selecione...":
             df[col_area] = pd.to_numeric(df[col_area], errors='coerce')
             df[col_terr] = pd.to_numeric(df[col_terr], errors='coerce')
             df[col_ano] = pd.to_numeric(df[col_ano], errors='coerce')
-            df['Ano_Transacao'] = df['Data de Transação'].astype(str).str.extract(r'(\d{4})').astype(float)
-            
+                        
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
 
             # Filtro Estatístico de Outliers
