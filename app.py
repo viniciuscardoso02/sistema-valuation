@@ -7,18 +7,15 @@ from geopy.geocoders import Nominatim
 from datetime import date
 import altair as alt
 import glob
-import difflib
-import unicodedata
 import numpy as np
 
 # Configuração da página corporativa
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
 st.title("🏢 Sistema de Valuation Inteligente - Home 2 Invest")
 
-# --- VERIFICAÇÃO DE DADOS ---
-arquivos = glob.glob('base_itbi_parte_*.parquet')
-if not arquivos:
-    st.error("Erro Crítico: Ficheiros de dados não encontrados na raiz do repositório.")
+# --- VERIFICAÇÃO DE DADOS HIGIENIZADOS ---
+if not glob.glob('base_itbi_limpa_*.parquet'):
+    st.error("Erro Crítico: Os arquivos fatiados 'base_itbi_limpa_*.parquet' não foram encontrados na raiz do repositório.")
     st.stop()
 
 # --- FUNÇÕES DE APOIO ---
@@ -34,46 +31,18 @@ def remover_acentos(txt):
     txt = str(txt).upper().strip()
     return ''.join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
 
-# --- INTELIGÊNCIA DE AGRUPAMENTO (FUZZY MATCHING) ---
+# --- CARREGAMENTO INSTANTÂNEO DE BAIRROS ---
 @st.cache_data
-def obtener_mapeamento_bairros():
+def carregar_lista_bairros():
     try:
-        query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
+        query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_limpa_*.parquet') WHERE Bairro IS NOT NULL"
         df = duckdb.query(query).df()
-        
-        bairros_brutos = df['Bairro'].dropna().unique()
-        
-        map_limpeza_inicial = {}
-        for b in bairros_brutos:
-            if str(b).strip() not in ('', '-', 'NAN', 'NONE'):
-                limpo = remover_acentos(str(b).split('-')[0])
-                if limpo:
-                    if limpo not in map_limpeza_inicial:
-                        map_limpeza_inicial[limpo] = []
-                    map_limpeza_inicial[limpo].append(b)
-
-        bairros_unicos_limpos = list(map_limpeza_inicial.keys())
-        bairros_unicos_limpos.sort(key=len, reverse=True)
-        
-        bairros_canonicos = []
-        agrupamentos = {}
-        
-        for b_limpo in bairros_unicos_limpos:
-            matches = difflib.get_close_matches(b_limpo, bairros_canonicos, n=1, cutoff=0.82)
-            if matches:
-                canonico = matches[0]
-                agrupamentos[canonico].extend(map_limpeza_inicial[b_limpo])
-            else:
-                bairros_canonicos.append(b_limpo)
-                agrupamentos[b_limpo] = map_limpeza_inicial[b_limpo]
-                
-        bairros_finais = ["Selecione..."] + sorted(list(agrupamentos.keys()))
-        return bairros_finais, agrupamentos
+        return ["Selecione..."] + sorted(df['Bairro'].astype(str).unique())
     except Exception as e:
-        st.sidebar.error(f"Aviso: Não foi possível carregar os bairros ({e})")
-        return ["Selecione..."], {}
+        st.sidebar.error(f"Erro ao carregar bairros: {e}")
+        return ["Selecione..."]
 
-bairros_disp, map_bairros = obtener_mapeamento_bairros()
+bairros_disp = carregar_lista_bairros()
 tipos_disp = ["Residenciais", "Apartamentos"]
 
 # --- BARRA LATERAL ---
@@ -103,9 +72,9 @@ area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_valu
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
-remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True, help="Remove registros com R$/m² fora da curva normal da região.")
+remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
 
-# --- MOTOR DE EXECUÇÃO ULTRA-RÁPIDO ---
+# --- MOTOR DE EXECUÇÃO ---
 if rua or bairro_alvo != "Selecione...":
     with st.spinner("A processar inteligência de mercado de alta velocidade..."):
         
@@ -127,7 +96,7 @@ if rua or bairro_alvo != "Selecione...":
         
         try:
             if rua:
-                geolocator = Nominatim(user_agent="h2i_valuation_pro_v16")
+                geolocator = Nominatim(user_agent="h2i_valuation_pro_v18")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
@@ -137,10 +106,10 @@ if rua or bairro_alvo != "Selecione...":
                     WITH base_distancia AS (
                         SELECT *,
                         (6371000 * acos(
-                            cos(radians({lat_c})) * cos(radians(Latitude)) * cos(radians(Longitude) - radians({lon_c})) + 
+                            cos(radians={lat_c})) * cos(radians(Latitude)) * cos(radians(Longitude) - radians({lon_c})) + 
                             sin(radians({lat_c})) * sin(radians(Latitude))
                         )) as dist_metros
-                        FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true)
+                        FROM read_parquet('base_itbi_limpa_*.parquet')
                         WHERE Latitude IS NOT NULL {condicao_extra}
                     )
                     SELECT * FROM base_distancia WHERE dist_metros <= {raio}
@@ -150,12 +119,10 @@ if rua or bairro_alvo != "Selecione...":
                     st.error("Logradouro não encontrado no mapa.")
                     st.stop()
             else:
-                variacoes_bairro = map_bairros.get(bairro_alvo, [bairro_alvo])
-                variacoes_sql = ", ".join([f"'{v.replace(chr(39), chr(39)+chr(39))}'" for v in variacoes_bairro])
-                
+                bairro_sql = bairro_alvo.replace("'", "''")
                 query = f"""
-                SELECT * FROM read_parquet('base_itbi_parte_*.parquet', union_by_name=true)
-                WHERE Bairro IN ({variacoes_sql}) {condicao_extra}
+                SELECT * FROM read_parquet('base_itbi_limpa_*.parquet')
+                WHERE Bairro = '{bairro_sql}' {condicao_extra}
                 """
                 df_bruto = duckdb.query(query).df()
                 
@@ -178,7 +145,7 @@ if rua or bairro_alvo != "Selecione...":
             
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
 
-            # --- FILTRO DE OUTLIERS (IQR) ---
+            # Filtro Estatístico de Outliers
             if remover_outliers and not df.empty:
                 df['Preco_m2_Construido'] = df[col_val] / df[col_area]
                 Q1 = df['Preco_m2_Construido'].quantile(0.25)
@@ -188,18 +155,11 @@ if rua or bairro_alvo != "Selecione...":
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
-                if bairro_alvo != "Selecione...":
-                    df['Bairro'] = bairro_alvo
-                else:
-                    df['Bairro'] = df['Bairro'].apply(lambda x: remover_acentos(str(x).split('-')[0]))
-
-                # --- NOVO MOTOR VETORIZADO DE INTELIGÊNCIA DE RETROFIT (SEM LOOP / SEM APPLY) ---
+                # Inteligência Vetorizada de Retrofit
                 df['Chave_Imovel'] = df['N° do Cadastro (SQL)'].fillna(df['Nome do Logradouro'] + df['Número'].fillna(''))
-                
                 df['Max_Area_Historica'] = df.groupby('Chave_Imovel')[col_area].transform('max')
                 df['Min_Area_Historica'] = df.groupby('Chave_Imovel')[col_area].transform('min')
                 df['Qtd_Areas_Unicas'] = df.groupby('Chave_Imovel')[col_area].transform('nunique')
-
                 df['Houve_Expansao'] = (df['Qtd_Areas_Unicas'] > 1) & ((df['Max_Area_Historica'] - df['Min_Area_Historica']) > 10)
 
                 condicoes = [
@@ -208,11 +168,8 @@ if rua or bairro_alvo != "Selecione...":
                 ]
                 escolhas = ['Modernizado (≥ 2018)', 'Modernizado (Retrofit)']
                 df['Categoria'] = np.select(condicoes, escolhas, default='Antigo')
-
-                # Limpeza de colunas auxiliares de memória
                 df = df.drop(columns=['Max_Area_Historica', 'Min_Area_Historica', 'Qtd_Areas_Unicas', 'Houve_Expansao'])
                 
-                # Aplicação da janela temporal selecionada
                 df = df[(df['Ano_Transacao'] >= ano_min) & (df['Ano_Transacao'] <= ano_max)]
 
                 if not df.empty:
@@ -221,6 +178,7 @@ if rua or bairro_alvo != "Selecione...":
                     idade_media = ano_atual - anos_validos.median() if not anos_validos.empty else None
                     texto_idade = f"{int(idade_media)} anos" if pd.notna(idade_media) else "Sem Registro"
 
+                    # --- INTERFACE ---
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Amostras no Período", len(df))
                     col2.metric("Valor Mediano", formata_moeda(df[col_val].median()))
@@ -229,11 +187,10 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
+                    # Gráfico
                     st.subheader("📊 Ágio de Mercado: Modernizadas vs Antigas (Por m² de Terreno)")
-                    
-                    df_grafico = df.copy()
-                    df_grafico = df_grafico.dropna(subset=[col_area, col_terr])
-                    df_grafico = df_grafico[df_grafico[col_terr] > 0]
+                    df_grafico = df.dropna(subset=[col_area, col_terr])
+                    df_grafico = df_grafico[df_grafico[col_terr] > 0].copy()
                     
                     if not df_grafico.empty:
                         df_grafico['R$/m² Terreno'] = df_grafico[col_val] / df_grafico[col_terr]
@@ -263,33 +220,25 @@ if rua or bairro_alvo != "Selecione...":
                         ).properties(width=65, height=350)
                         
                         bars = base.mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=24)
+                        text = base.mark_text(align='left', baseline='middle', dy=-5, angle=270, fontSize=11, fontWeight='bold', color='#2c3e50').encode(text='Texto_Valor:N')
                         
-                        text = base.mark_text(
-                            align='left', baseline='middle', dy=-5, angle=270, fontSize=11, fontWeight='bold', color='#2c3e50'
-                        ).encode(text='Texto_Valor:N')
-                        
-                        grafico = alt.layer(bars, text).facet(
-                            column=alt.Column('Faixa de Área:N', title=None, sort=ordem_faixas, header=alt.Header(labelFontSize=12, labelFontWeight='bold', labelOrient='bottom'))
-                        ).configure_view(stroke='transparent')
-                        
+                        grafico = alt.layer(bars, text).facet(column=alt.Column('Faixa de Área:N', title=None, sort=ordem_faixas, header=alt.Header(labelFontSize=12, labelFontWeight='bold', labelOrient='bottom'))).configure_view(stroke='transparent')
                         st.altair_chart(grafico, use_container_width=True)
-                    else:
-                        st.info("Dados insuficientes para gerar o gráfico de valorização nesta seleção.")
                     
                     st.markdown("---")
                     
+                    # Mapa (Google Maps)
                     st.subheader("📍 Distribuição Espacial")
                     if rua and lat_c and lon_c:
                         m = folium.Map([lat_c, lon_c], zoom_start=15, tiles=None)
-                        folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
-                        txt_alvo = f"Alvo: {rua}, {num}" if num else f"Alvo: {rua} (Centro)"
-                        folium.Marker([lat_c, lon_c], popup=txt_alvo, icon=folium.Icon(color="red", icon="home")).add_to(m)
-                        folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
                     else:
-                        lat_media = df['Latitude'].mean()
-                        lon_media = df['Longitude'].mean()
-                        m = folium.Map([lat_media, lon_media], zoom_start=14, tiles=None)
-                        folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
+                        m = folium.Map([df['Latitude'].mean(), df['Longitude'].mean()], zoom_start=14, tiles=None)
+                    
+                    folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
+                    
+                    if rua and lat_c and lon_c:
+                        folium.Marker([lat_c, lon_c], popup=f"Alvo: {rua}", icon=folIcon(color="red", icon="home")).add_to(m)
+                        folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.1).add_to(m)
                         
                     for _, r in df.iterrows():
                         if pd.notna(r['Latitude']) and pd.notna(r['Longitude']):
@@ -298,8 +247,9 @@ if rua or bairro_alvo != "Selecione...":
                             folium.CircleMarker([r['Latitude'], r['Longitude']], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
                     
                     folium_static(m, width=1200, height=500)
-                    st.markdown("---")
                     
+                    # Tabelas
+                    st.markdown("---")
                     st.subheader("🔝 Top 5 (Valor / m² Terreno)")
                     df_terreno_valido = df[df[col_terr] > 0].copy()
                     if not df_terreno_valido.empty:
@@ -307,17 +257,17 @@ if rua or bairro_alvo != "Selecione...":
                         df_top5 = df_terreno_valido.sort_values(by='Valor/m² Terreno', ascending=False).head(5).copy()
                         df_top5['Valor/m² Terreno'] = df_top5['Valor/m² Terreno'].apply(formata_moeda)
                         df_top5[col_val] = df_top5[col_val].apply(formata_moeda)
-                        st.dataframe(df_top5.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore').head(5), use_container_width=True)
+                        st.dataframe(df_top5.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore'), use_container_width=True)
 
                     st.subheader("📋 Planilha Detalhada")
                     df_visual = df.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore').copy()
                     df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                     st.dataframe(df_visual, use_container_width=True)
                 else:
-                    st.warning(f"Existem transações, mas nenhuma dentro da janela de anos ({ano_min}-{ano_max}).")
+                    st.warning("Sem transações na janela de tempo selecionada.")
             else:
-                st.warning("Imóveis identificados não possuem registros financeiros após o filtro de outliers.")
+                st.warning("Nenhum imóvel restou após o filtro de outliers.")
         else:
-            st.warning("Nenhum comparável localizado para as especificações digitadas.")
+            st.warning("Nenhum comparável localizado.")
 else:
     st.info("👈 Indique um Logradouro ou selecione um Bairro para iniciar.")
