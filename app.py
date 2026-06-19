@@ -162,8 +162,8 @@ if rua or bairro_alvo != "Selecione...":
                 df['Houve_Expansao'] = (df['Qtd_Areas_Unicas'] > 1) & ((df['Max_Area_Historica'] - df['Min_Area_Historica']) > 10)
 
                 condicoes = [
-                    (df[col_ano] >= 2018),
-                    (df['Houve_Expansao'] & (df[col_area] == df['Max_Area_Historica']))
+                    (df[col_ano].fillna(0) >= 2018).astype(bool),
+                    (df['Houve_Expansao'].fillna(False) & (df[col_area] == df['Max_Area_Historica']).fillna(False)).astype(bool)
                 ]
                 escolhas = ['Modernizado (≥ 2018)', 'Modernizado (Retrofit)']
                 df['Categoria'] = np.select(condicoes, escolhas, default='Antigo')
