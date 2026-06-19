@@ -15,7 +15,8 @@ st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
 st.title("🏢 Sistema de Valuation Inteligente - Home 2 Invest")
 
 # --- VERIFICAÇÃO DE DADOS HIGIENIZADOS ---
-if not glob.glob('base_itbi_limpa_*.parquet'):
+arquivos_parquet = glob.glob('base_itbi_limpa_*.parquet')
+if not arquivos_parquet:
     st.error("Erro Crítico: Os arquivos fatiados 'base_itbi_limpa_*.parquet' não foram encontrados na raiz do repositório.")
     st.stop()
 
@@ -32,15 +33,21 @@ def remover_acentos(txt):
     txt = str(txt).upper().strip()
     return ''.join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
 
-# --- CARREGAMENTO INSTANTÂNEO DE BAIRROS ---
+# --- CARREGAMENTO INSTANTÂNEO DE BAIRROS (CORRIGIDO) ---
 @st.cache_data
 def carregar_lista_bairros():
     try:
-        query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_limpa_*.parquet') WHERE Bairro IS NOT NULL"
+        # O parâmetro union_by_name=true é essencial ao ler múltiplos arquivos
+        query = "SELECT DISTINCT Bairro FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true) WHERE Bairro IS NOT NULL"
         df_b = duckdb.query(query).df()
         return ["Selecione..."] + sorted(df_b['Bairro'].astype(str).unique())
-    except Exception:
-        return ["Selecione..."]
+    except Exception as e:
+        # Plano B: Carregamento infalível via Pandas se o DuckDB travar
+        bairros = set()
+        for f in arquivos_parquet:
+            df_temp = pd.read_parquet(f, columns=['Bairro'])
+            bairros.update(df_temp['Bairro'].dropna().astype(str).unique())
+        return ["Selecione..."] + sorted(list(bairros))
 
 bairros_disp = carregar_lista_bairros()
 tipos_disp = ["Residenciais", "Apartamentos"]
@@ -74,12 +81,13 @@ st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
 remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
 
-# --- VERIFICAÇÃO DE ESTRUTURA (ANTI-CRASH) ---
+# --- VERIFICAÇÃO DE ESTRUTURA BLINDADA ---
 try:
-    amostra_cols = duckdb.query("SELECT * FROM read_parquet('base_itbi_limpa_*.parquet') LIMIT 1").df().columns
+    amostra_cols = duckdb.query("SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true) LIMIT 1").df().columns
     tem_lat_lon = 'Latitude' in amostra_cols and 'Longitude' in amostra_cols
 except:
-    tem_lat_lon = False
+    amostra_cols = pd.read_parquet(arquivos_parquet[0]).columns
+    tem_lat_lon = 'Latitude' in amostra_cols and 'Longitude' in amostra_cols
 
 # --- MOTOR DE EXECUÇÃO ---
 if rua or bairro_alvo != "Selecione...":
@@ -104,7 +112,7 @@ if rua or bairro_alvo != "Selecione...":
         try:
             if rua:
                 if not tem_lat_lon:
-                    st.warning("⚠️ A busca por raio está indisponível porque a base atual não possui coordenadas geográficas cadastradas. Use a busca por Bairro.")
+                    st.warning("⚠️ A busca por raio está indisponível porque a base não possui coordenadas geográficas cadastradas. Use a busca por Bairro.")
                     st.stop()
 
                 geolocator = Nominatim(user_agent="h2i_valuation_pro_final")
@@ -120,7 +128,7 @@ if rua or bairro_alvo != "Selecione...":
                             cos(radians({lat_c})) * cos(radians(Latitude)) * cos(radians(Longitude) - radians({lon_c})) + 
                             sin(radians({lat_c})) * sin(radians(Latitude))
                         )) as dist_metros
-                        FROM read_parquet('base_itbi_limpa_*.parquet')
+                        FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
                         WHERE Latitude IS NOT NULL {condicao_extra}
                     )
                     SELECT * FROM base_distancia WHERE dist_metros <= {raio}
@@ -132,14 +140,34 @@ if rua or bairro_alvo != "Selecione...":
             else:
                 bairro_sql = bairro_alvo.replace("'", "''")
                 query = f"""
-                SELECT * FROM read_parquet('base_itbi_limpa_*.parquet')
+                SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
                 WHERE Bairro = '{bairro_sql}' {condicao_extra}
                 """
                 df_bruto = duckdb.query(query).df()
                 
         except Exception as e:
-            st.error(f"Falha técnica na consulta: {e}")
-            st.stop()
+            # Plano B: Fallback infalível ativado
+            dfs_fallback = [pd.read_parquet(f) for f in arquivos_parquet]
+            df_completo = pd.concat(dfs_fallback, ignore_index=True)
+            
+            if rua and lat_c and lon_c:
+                lat1, lon1 = np.radians(lat_c), np.radians(lon_c)
+                lat2, lon2 = np.radians(df_completo['Latitude']), np.radians(df_completo['Longitude'])
+                a = np.sin((lat2 - lat1)/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1)/2)**2
+                df_completo['dist_metros'] = 6371000 * (2 * np.arcsin(np.sqrt(a)))
+                df_bruto = df_completo[df_completo['dist_metros'] <= raio].copy()
+            else:
+                df_bruto = df_completo[df_completo['Bairro'] == bairro_alvo].copy()
+
+            if tipo == "Residenciais":
+                df_bruto = df_bruto[df_bruto['Descrição do uso (IPTU)'].str.contains('RESIDÊN|CASA', case=False, na=False)]
+            elif tipo == "Apartamentos":
+                df_bruto = df_bruto[df_bruto['Descrição do uso (IPTU)'].str.contains('APARTAMENTO', case=False, na=False)]
+            
+            if area_const_alvo > 0:
+                df_bruto = df_bruto[(df_bruto['Área Construída (m2)'] >= area_const_alvo * 0.75) & (df_bruto['Área Construída (m2)'] <= area_const_alvo * 1.25)]
+            if area_terr_alvo > 0:
+                df_bruto = df_bruto[(df_bruto['Área do Terreno (m2)'] >= area_terr_alvo * 0.75) & (df_bruto['Área do Terreno (m2)'] <= area_terr_alvo * 1.25)]
             
         if not df_bruto.empty:
             df = df_bruto.copy()
@@ -148,7 +176,6 @@ if rua or bairro_alvo != "Selecione...":
             col_terr = 'Área do Terreno (m2)'
             col_ano = 'Ano_Construcao_Geo'
             
-            # Conversões Seguras
             for c in [col_val, col_area, col_terr, col_ano]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -156,12 +183,11 @@ if rua or bairro_alvo != "Selecione...":
                     df[c] = pd.NA
             
             if 'Ano_Transacao' not in df.columns:
-                st.error("A base fatiada está corrompida. O Ano da Transação não foi localizado.")
+                st.error("Erro na leitura temporal. Contate o administrador.")
                 st.stop()
 
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
 
-            # Filtro Estatístico de Outliers
             if remover_outliers and not df.empty:
                 df['Preco_m2_Construido'] = df[col_val] / df[col_area]
                 Q1 = df['Preco_m2_Construido'].quantile(0.25)
@@ -171,7 +197,6 @@ if rua or bairro_alvo != "Selecione...":
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
-                # Inteligência Vetorizada de Retrofit 100% BLINDADA
                 chave_col = 'N° do Cadastro (SQL)' if 'N° do Cadastro (SQL)' in df.columns else 'Nome do Logradouro'
                 df['Chave_Imovel'] = df[chave_col].astype(str) + df.get('Número', '').astype(str)
                 
@@ -180,7 +205,6 @@ if rua or bairro_alvo != "Selecione...":
                 df['Qtd_Areas_Unicas'] = df.groupby('Chave_Imovel')[col_area].transform('nunique')
                 df['Houve_Expansao'] = (df['Qtd_Areas_Unicas'] > 1) & ((df['Max_Area_Historica'] - df['Min_Area_Historica']) > 10)
 
-                # Arrays Booleanos rigorosos para o numpy.select (Anti-TypeError)
                 c1 = (df[col_ano].fillna(0) >= 2018).astype(bool)
                 c2 = (df['Houve_Expansao'].fillna(False) & (df[col_area] == df['Max_Area_Historica']).fillna(False)).astype(bool)
                 
@@ -189,7 +213,6 @@ if rua or bairro_alvo != "Selecione...":
                 df['Categoria'] = np.select(condicoes, escolhas, default='Antigo')
                 
                 df = df.drop(columns=['Max_Area_Historica', 'Min_Area_Historica', 'Qtd_Areas_Unicas', 'Houve_Expansao'])
-                
                 df = df[(df['Ano_Transacao'] >= ano_min) & (df['Ano_Transacao'] <= ano_max)]
 
                 if not df.empty:
@@ -245,19 +268,15 @@ if rua or bairro_alvo != "Selecione...":
                             grafico = alt.layer(bars, text).facet(column=alt.Column('Faixa de Área:N', title=None, sort=ordem_faixas, header=alt.Header(labelFontSize=12, labelFontWeight='bold', labelOrient='bottom'))).configure_view(stroke='transparent')
                             st.altair_chart(grafico, use_container_width=True)
                     else:
-                        st.warning("Coluna de Área do Terreno não localizada para exibir o gráfico.")
+                        st.warning("Coluna de Área do Terreno não localizada.")
                     
                     st.markdown("---")
                     
-                    # --- MAPA 100% BLINDADO (Anti-KeyError) ---
                     st.subheader("📍 Distribuição Espacial")
-                    
-                    # Procura colunas de coordenadas de forma segura
                     col_lat = next((c for c in df.columns if c.lower() in ['lat', 'latitude']), None)
                     col_lon = next((c for c in df.columns if c.lower() in ['lon', 'lng', 'longitude']), None)
                     tem_coords_validas = bool(col_lat and col_lon and df[col_lat].notna().any())
 
-                    # Define o centro do mapa ignorando vazios
                     if rua and lat_c and lon_c:
                         centro = [lat_c, lon_c]
                         zoom = 15
@@ -265,7 +284,7 @@ if rua or bairro_alvo != "Selecione...":
                         centro = [df[col_lat].dropna().mean(), df[col_lon].dropna().mean()]
                         zoom = 14
                     else:
-                        centro = [-23.5505, -46.6333] # Fallback: Centro de SP
+                        centro = [-23.5505, -46.6333]
                         zoom = 12
                         
                     m = folium.Map(centro, zoom_start=zoom, tiles=None)
@@ -282,11 +301,10 @@ if rua or bairro_alvo != "Selecione...":
                                 popup_txt = f"<b>{r.get('Categoria', '')}</b><br>{r.get('Nome do Logradouro', '')}<br>Valor: {formata_moeda(r.get(col_val))}<br>Área: {r.get(col_area)}m²"
                                 folium.CircleMarker([r[col_lat], r[col_lon]], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
                     else:
-                        st.info("ℹ️ Os imóveis encontrados nesta busca não possuem coordenadas (Latitude/Longitude) cadastradas na base original da prefeitura para a plotagem dos pinos.")
+                        st.info("ℹ️ Os imóveis encontrados nesta busca não possuem coordenadas (Latitude/Longitude) cadastradas.")
                     
                     folium_static(m, width=1200, height=500)
                     
-                    # Tabelas
                     st.markdown("---")
                     st.subheader("🔝 Top 5 (Valor / m² Terreno)")
                     if col_terr in df.columns:
