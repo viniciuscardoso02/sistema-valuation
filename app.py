@@ -7,17 +7,14 @@ from geopy.geocoders import Nominatim
 from datetime import date
 import altair as alt
 import glob
-import unicodedata
 import numpy as np
 
-# Configuração da página corporativa
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
 st.title("🏢 Sistema de Valuation Inteligente - Home 2 Invest")
 
-# --- VERIFICAÇÃO DE DADOS HIGIENIZADOS ---
 arquivos_parquet = glob.glob('base_itbi_limpa_*.parquet')
 if not arquivos_parquet:
-    st.error("Erro Crítico: Os arquivos fatiados 'base_itbi_limpa_*.parquet' não foram encontrados no repositório.")
+    st.error("Arquivos de dados não encontrados.")
     st.stop()
 
 def formata_moeda(valor):
@@ -26,17 +23,6 @@ def formata_moeda(valor):
         return f"R$ {float(valor):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
     except:
         return "-"
-
-def remover_acentos(txt):
-    if pd.isna(txt): return ""
-    txt = str(txt).upper().strip()
-    return ''.join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
-
-def extrair_palavras_chave_rua(nome_rua):
-    rua_limpa = remover_acentos(nome_rua)
-    termos_ignorados = ['RUA', 'AVENIDA', 'AV', 'ALAMEDA', 'TRAVESSA', 'PRACA', 'DOS', 'DAS', 'DE', 'DO', 'DA', 'PROFESSOR', 'DR', 'DOUTOR']
-    palavras = [p for p in rua_limpa.split() if p not in termos_ignorados and len(p) > 2]
-    return palavras
 
 @st.cache_data
 def carregar_lista_bairros():
@@ -54,9 +40,8 @@ def carregar_lista_bairros():
 bairros_disp = carregar_lista_bairros()
 tipos_disp = ["Residenciais", "Apartamentos"]
 
-# --- BARRA LATERAL ---
 st.sidebar.header("📍 Parâmetros de Busca")
-rua = st.sidebar.text_input("Logradouro (Busca Híbrida: Nome + Raio)")
+rua = st.sidebar.text_input("Logradouro (Busca por Raio)")
 num = st.sidebar.text_input("Número (Opcional)")
 raio = st.sidebar.slider("Raio de busca vizinhança (metros)", 100, 2500, 500)
 
@@ -75,69 +60,49 @@ ano_min, ano_max = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.header("📐 Dimensões do Alvo (Opcional)")
-area_const_alvo = st.sidebar.number_input("Área Construída Alvo (m²)", min_value=0, value=0, step=10)
-area_terr_alvo = st.sidebar.number_input("Área do Terreno Alvo (m²)", min_value=0, value=0, step=10)
-
-st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
 remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
 
-# --- MOTOR DE EXECUÇÃO ---
 if rua or bairro_alvo != "Selecione...":
-    with st.spinner("Compilando histórico e mapeando vizinhança..."):
+    with st.spinner("Compilando histórico e cruzando coordenadas..."):
         
         filtros_sql = []
         if tipo == "Residenciais":
             filtros_sql.append("(UPPER(\"Descrição do uso (IPTU)\") LIKE '%RESIDÊN%' OR UPPER(\"Descrição do uso (IPTU)\") LIKE '%CASA%')")
         elif tipo == "Apartamentos":
             filtros_sql.append("UPPER(\"Descrição do uso (IPTU)\") LIKE '%APARTAMENTO%'")
-        
-        if area_const_alvo > 0:
-            filtros_sql.append(f"TRY_CAST(\"Área Construída (m2)\" AS FLOAT) BETWEEN {area_const_alvo * 0.75} AND {area_const_alvo * 1.25}")
-        if area_terr_alvo > 0:
-            filtros_sql.append(f"TRY_CAST(\"Área do Terreno (m2)\" AS FLOAT) BETWEEN {area_terr_alvo * 0.75} AND {area_terr_alvo * 1.25}")
             
         condicao_extra = " AND " + " AND ".join(filtros_sql) if filtros_sql else ""
         df_bruto = pd.DataFrame()
         lat_c, lon_c = None, None
-        palavras_rua = []
         
         try:
             if rua:
-                # 1. Busca API para achar centro do mapa
                 geolocator = Nominatim(user_agent="h2i_valuation_pro")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
-                palavras_rua = extrair_palavras_chave_rua(rua)
-                cond_rua_textual = " AND ".join([f"UPPER(\"Nome do Logradouro\") LIKE '%{p}%'" for p in palavras_rua]) if palavras_rua else "1=0"
-                
                 if loc:
                     lat_c, lon_c = loc.latitude, loc.longitude
-                    st.success(f"📍 Endereço Alvo Mapeado: **{loc.address.split(',')[0]}** (Buscando rua exata + raio vizinhança)")
+                    st.success(f"📍 Endereço Alvo Mapeado: **{loc.address.split(',')[0]}**")
                     
-                    # Bounding box para não travar a memória (Puxa rua exata OR imóveis vizinhos próximos)
-                    delta_lat = raio / 111000
-                    delta_lon = raio / (111000 * np.cos(np.radians(lat_c)))
-                    
+                    # Motor de cruzamento geográfico original
                     query = f"""
-                    SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
-                    WHERE (
-                        ({cond_rua_textual}) 
-                        OR 
-                        (TRY_CAST(Latitude AS FLOAT) BETWEEN {lat_c - delta_lat} AND {lat_c + delta_lat}
-                         AND TRY_CAST(Longitude AS FLOAT) BETWEEN {lon_c - delta_lon} AND {lon_c + delta_lon})
-                    ) {condicao_extra}
+                    WITH base_distancia AS (
+                        SELECT *,
+                        (6371000 * acos(
+                            cos(radians({lat_c})) * cos(radians(TRY_CAST(Latitude AS FLOAT))) * cos(radians(TRY_CAST(Longitude AS FLOAT)) - radians({lon_c})) + 
+                            sin(radians({lat_c})) * sin(radians(TRY_CAST(Latitude AS FLOAT)))
+                        )) as dist_metros
+                        FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
+                        WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL {condicao_extra}
+                    )
+                    SELECT * FROM base_distancia WHERE dist_metros <= {raio}
                     """
                     df_bruto = duckdb.query(query).df()
                 else:
-                    st.info(f"O mapa não achou as coordenadas exatas, mas vamos trazer o histórico textual da rua.")
-                    query = f"""
-                    SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
-                    WHERE {cond_rua_textual} {condicao_extra}
-                    """
-                    df_bruto = duckdb.query(query).df()
+                    st.error("Logradouro não localizado pela API.")
+                    st.stop()
             else:
                 bairro_sql = bairro_alvo.replace("'", "''")
                 query = f"""
@@ -166,26 +131,6 @@ if rua or bairro_alvo != "Selecione...":
             
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
 
-            # LÓGICA CORRIGIDA: Mantém quem é da rua exata OU quem está no raio de distância
-            if rua and lat_c and lon_c and 'Latitude' in df.columns and 'Longitude' in df.columns:
-                # Função para identificar se o imóvel pertence à rua buscada textualmente
-                def eh_rua_alvo(logradouro, palavras):
-                    if pd.isna(logradouro): return False
-                    nome_up = str(logradouro).upper()
-                    return all(p in nome_up for p in palavras)
-                
-                df['Is_Rua_Alvo'] = df['Nome do Logradouro'].apply(lambda x: eh_rua_alvo(x, palavras_rua))
-                
-                # Calcula distância apenas para quem tem coordenada
-                lat1, lon1 = np.radians(lat_c), np.radians(lon_c)
-                lat2, lon2 = np.radians(df['Latitude']), np.radians(df['Longitude'])
-                a = np.sin((lat2 - lat1)/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1)/2)**2
-                df['dist_metros'] = 6371000 * (2 * np.arcsin(np.sqrt(a)))
-                
-                # Mantém se: É da própria rua (não perde o histórico) OU (Tem coordenada e está no raio)
-                df = df[df['Is_Rua_Alvo'] | ((df['dist_metros'] <= raio) & df['Latitude'].notna())].copy()
-
-            # Filtro Estatístico de Outliers (IQR)
             if remover_outliers and not df.empty:
                 df['Preco_m2_Construido'] = df[col_val] / df[col_area]
                 Q1 = df['Preco_m2_Construido'].quantile(0.25)
@@ -195,7 +140,6 @@ if rua or bairro_alvo != "Selecione...":
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
-                # Motor de Identificação de Retrofits
                 chave_col = 'N° do Cadastro (SQL)' if 'N° do Cadastro (SQL)' in df.columns else 'Nome do Logradouro'
                 df['Chave_Imovel'] = df[chave_col].astype(str) + df.get('Número', '').astype(str)
                 
@@ -219,14 +163,13 @@ if rua or bairro_alvo != "Selecione...":
                     texto_idade = f"{int(idade_media)} anos" if pd.notna(idade_media) else "Sem Registro"
 
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Amostras Resgatadas (Rua + Raio)", len(df))
+                    col1.metric("Amostras Resgatadas no Raio", len(df))
                     col2.metric("Valor Mediano", formata_moeda(df[col_val].median()))
                     col3.metric("Mediana / m² Construído", formata_moeda((df[col_val] / df[col_area]).median()))
                     col4.metric("Idade Mediana Predial", texto_idade)
                     
                     st.markdown("---")
                     
-                    # Gráfico de Ágio
                     st.subheader("📊 Ágio de Mercado: Modernizadas vs Antigas (Por m² de Terreno)")
                     if col_terr in df.columns and df[col_terr].notna().any():
                         df_grafico = df.dropna(subset=[col_area, col_terr])
@@ -260,7 +203,6 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
-                    # Mapa 
                     st.subheader("📍 Região Analisada e Comparáveis Georreferenciados")
                     centro = [lat_c, lon_c] if (lat_c and lon_c) else [-23.5505, -46.6333]
                     m = folium.Map(centro, zoom_start=15, tiles=None)
@@ -279,8 +221,8 @@ if rua or bairro_alvo != "Selecione...":
                     folium_static(m, width=1200, height=500)
                     
                     st.markdown("---")
-                    st.subheader("📋 Planilha de Comparáveis na Região (Com e Sem Coordenadas)")
-                    df_visual = df.drop(columns=['dist_metros', 'Chave_Imovel', 'Is_Rua_Alvo'], errors='ignore').copy()
+                    st.subheader("📋 Planilha de Comparáveis na Região")
+                    df_visual = df.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore').copy()
                     df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                     st.dataframe(df_visual, use_container_width=True)
                 else:
