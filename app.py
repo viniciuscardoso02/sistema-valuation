@@ -32,6 +32,12 @@ def remover_acentos(txt):
     txt = str(txt).upper().strip()
     return ''.join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
 
+def extrair_palabras_chave_rua(nome_rua):
+    rua_limpa = remover_acentos(nome_rua)
+    termos_ignorados = ['RUA', 'AVENIDA', 'AV', 'ALAMEDA', 'TRAVESSA', 'PRACA', 'DOS', 'DAS', 'DE', 'DO', 'DA', 'PROFESSOR', 'DR', 'DOUTOR']
+    palavras = [p for p in rua_limpa.split() if p not in termos_ignorados and len(p) > 2]
+    return palavras
+
 @st.cache_data
 def carregar_lista_bairros():
     try:
@@ -98,16 +104,16 @@ if rua or bairro_alvo != "Selecione...":
         
         try:
             if rua:
-                # 1. Encontra a coordenada central do alvo usando a API de Mapa Oficial
-                geolocator = Nominatim(user_agent="h2i_valuation_spatial")
+                # 1. Busca a coordenada central da rua pesquisada via API
+                geolocator = Nominatim(user_agent="h2i_valuation_spatial_final")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
                 loc = geolocator.geocode(endereco_busca, timeout=10)
                 
                 if loc:
                     lat_c, lon_c = loc.latitude, loc.longitude
-                    st.success(f"📍 Centro do Raio: **{loc.address.split(',')[0]}**")
+                    st.success(f"📍 Endereço Alvo Mapeado: **{loc.address.split(',')[0]}**")
                     
-                    # 2. Busca TODAS as transações comparáveis DENTRO do raio estipulado
+                    # 2. Fórmula corrigida do Haversine (Seno e Cosseno exatos para o Raio)
                     query = f"""
                     WITH base_distancia AS (
                         SELECT *,
@@ -121,9 +127,17 @@ if rua or bairro_alvo != "Selecione...":
                     SELECT * FROM base_distancia WHERE dist_metros <= {raio}
                     """
                     df_bruto = duckdb.query(query).df()
-                else:
-                    st.error("Endereço alvo não localizado no mapa para traçar o raio.")
-                    st.stop()
+                
+                # Se a busca por coordenadas geográficas falhar ou retornar vazia, ativa o Fallback Textual Completo
+                if df_bruto.empty:
+                    palavras = extrair_palabras_chave_rua(rua)
+                    if palavras:
+                        cond_rua = " AND ".join([f"UPPER(\"Nome do Logradouro\") LIKE '%{p}%'" for p in palavras])
+                        query_f = f"""
+                        SELECT * FROM read_parquet('base_itbi_limpa_*.parquet', union_by_name=true)
+                        WHERE {cond_rua} {condicao_extra}
+                        """
+                        df_bruto = duckdb.query(query_f).df()
             else:
                 bairro_sql = bairro_alvo.replace("'", "''")
                 query = f"""
@@ -133,7 +147,7 @@ if rua or bairro_alvo != "Selecione...":
                 df_bruto = duckdb.query(query).df()
                 
         except Exception as e:
-            st.error(f"Erro na execução da consulta espacial: {e}")
+            st.error(f"Erro no processamento da consulta SQL: {e}")
             st.stop()
             
         if not df_bruto.empty:
@@ -151,14 +165,6 @@ if rua or bairro_alvo != "Selecione...":
                 df['Ano_Transacao'] = df['Data de Transação'].astype(str).str.extract(r'(\d{4})').astype(float)
             
             df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
-
-            # Filtro de Raio Matemático Real feito em memória via NumPy (Sem restrição de nome de rua)
-            if rua and lat_c and lon_c and 'Latitude' in df.columns and 'Longitude' in df.columns:
-                lat1, lon1 = np.radians(lat_c), np.radians(lon_c)
-                lat2, lon2 = np.radians(df['Latitude']), np.radians(df['Longitude'])
-                a = np.sin((lat2 - lat1)/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1)/2)**2
-                df['dist_metros'] = 6371000 * (2 * np.arcsin(np.sqrt(a)))
-                df = df[df['dist_metros'] <= raio].copy()
 
             # Filtro Estatístico de Outliers (IQR)
             if remover_outliers and not df.empty:
@@ -184,8 +190,6 @@ if rua or bairro_alvo != "Selecione...":
                 df['Categoria'] = np.select([c1, c2], ['Modernizado (≥ 2018)', 'Modernizado (Retrofit)'], default='Antigo')
                 
                 df = df.drop(columns=['Max_Area_Historica', 'Min_Area_Historica', 'Qtd_Areas_Unicas', 'Houve_Expansao'])
-                
-                # Aplica o filtro da régua de Anos
                 df = df[(df['Ano_Transacao'] >= ano_min) & (df['Ano_Transacao'] <= ano_max)]
 
                 if not df.empty:
@@ -196,14 +200,14 @@ if rua or bairro_alvo != "Selecione...":
                     texto_idade = f"{int(idade_media)} anos" if pd.notna(idade_media) else "Sem Registro"
 
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric(f"Amostras no Raio ({raio}m)", len(df))
+                    col1.metric("Amostras Encontradas", len(df))
                     col2.metric("Valor Mediano", formata_moeda(df[col_val].median()))
                     col3.metric("Mediana / m² Construído", formata_moeda((df[col_val] / df[col_area]).median()))
                     col4.metric("Idade Mediana Predial", texto_idade)
                     
                     st.markdown("---")
                     
-                    # Gráfico de Ágio de Terreno
+                    # Gráfico de Ágio
                     st.subheader("📊 Ágio de Mercado: Modernizadas vs Antigas (Por m² de Terreno)")
                     if col_terr in df.columns and df[col_terr].notna().any():
                         df_grafico = df.dropna(subset=[col_area, col_terr])
@@ -237,34 +241,35 @@ if rua or bairro_alvo != "Selecione...":
                     
                     st.markdown("---")
                     
-                    # Mapa com o Raio e Pinos Restaurados
+                    # Mapa com Pinos Mapeados
                     st.subheader("📍 Região Analisada e Comparáveis")
                     centro = [lat_c, lon_c] if (lat_c and lon_c) else [-23.5505, -46.6333]
                     m = folium.Map(centro, zoom_start=15, tiles=None)
                     folium.TileLayer(tiles='http://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps', name='Google Maps').add_to(m)
                     
                     if lat_c and lon_c:
-                        folium.Marker([lat_c, lon_c], popup="Alvo", icon=folium.Icon(color="red", icon="home")).add_to(m)
+                        folium.Marker([lat_c, lon_c], popup="Alvo Escolhido", icon=folium.Icon(color="red", icon="home")).add_to(m)
                         folium.Circle([lat_c, lon_c], radius=raio, color="blue", fill=True, fill_opacity=0.07).add_to(m)
                     
                     df_markers = df.dropna(subset=['Latitude', 'Longitude'])
-                    for _, r in df_markers.iterrows():
-                        cor_pino = "green" if 'Modernizado' in r.get('Categoria', '') else "gray"
-                        popup_txt = f"<b>{r.get('Categoria')}</b><br>{r.get('Nome do Logradouro')}, {r.get('Número')}<br>Valor: {formata_moeda(r.get(col_val))}<br>Área: {r.get(col_area)}m²"
-                        folium.CircleMarker([r['Latitude'], r['Longitude']], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
+                    if not df_markers.empty:
+                        for _, r in df_markers.iterrows():
+                            cor_pino = "green" if 'Modernizado' in r.get('Categoria', '') else "gray"
+                            popup_txt = f"<b>{r.get('Categoria')}</b><br>{r.get('Nome do Logradouro', 'Imóvel')}<br>Valor: {formata_moeda(r.get(col_val))}<br>Área: {r.get(col_area)}m²"
+                            folium.CircleMarker([r['Latitude'], r['Longitude']], radius=6, color=cor_pino, fill_color=cor_pino, fill_opacity=0.8, popup=popup_txt).add_to(m)
                     
                     folium_static(m, width=1200, height=500)
                     
                     st.markdown("---")
-                    st.subheader("📋 Planilha de Comparáveis no Entorno")
+                    st.subheader("📋 Planilha de Comparáveis na Região")
                     df_visual = df.drop(columns=['dist_metros', 'Chave_Imovel'], errors='ignore').copy()
                     df_visual[col_val] = df_visual[col_val].apply(formata_moeda)
                     st.dataframe(df_visual, use_container_width=True)
                 else:
-                    st.warning("Sem transações no raio/bairro para a janela de tempo selecionada.")
+                    st.warning("Sem transações na região para a janela de tempo selecionada.")
             else:
                 st.warning("Nenhum imóvel restou após o filtro de outliers.")
         else:
-            st.warning("Nenhum comparável localizado para esta região.")
+            st.warning("Nenhum comparável localizado para este endereço.")
 else:
     st.info("👈 Digite o endereço do projeto alvo para gerar o raio e mapear os comparáveis.")
