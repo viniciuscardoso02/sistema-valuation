@@ -153,6 +153,29 @@ def to_num(df, name):
     return pd.Series(np.nan, index=df.index, dtype="float64")
 
 
+def coord_sql(col):
+    """
+    Expressão SQL que converte uma coluna de coordenada para DOUBLE de forma
+    blindada, INDEPENDENTE de como ela veio do parquet (DOUBLE já limpo, ou
+    VARCHAR com vírgula decimal '-23,55'). Faz: CAST p/ texto -> troca vírgula
+    por ponto -> TRY_CAST p/ DOUBLE. Coordenadas não têm separador de milhar,
+    então trocar só a vírgula é seguro. Isto torna a busca por raio imune a
+    fatias do ETL que não tiveram a vírgula corrigida.
+    """
+    return f"TRY_CAST(REPLACE(CAST(\"{col}\" AS VARCHAR), ',', '.') AS DOUBLE)"
+
+
+def get_coord(df, name, parsed_name):
+    """Coordenada numérica no lado Python: usa a coluna já parseada pelo SQL
+    (_lat/_lon) se existir; senão converte a original tratando a vírgula."""
+    if parsed_name in df.columns:
+        return pd.to_numeric(df[parsed_name], errors="coerce")
+    if name in df.columns:
+        s = df[name].astype(str).str.strip().str.replace(",", ".", regex=False)
+        return pd.to_numeric(s, errors="coerce")
+    return pd.Series(np.nan, index=df.index, dtype="float64")
+
+
 # ============================================================================
 # 4. LISTA DE BAIRROS
 # ============================================================================
@@ -246,16 +269,71 @@ if rua or bairro_alvo != "Selecione...":
                 if loc and tem_geo:
                     lat_c, lon_c = loc.latitude, loc.longitude
                     st.success(f"📍 Endereço Alvo Localizado: **{loc.address.split(',')[0]}**")
+
+                    lat_e = coord_sql("Latitude")
+                    lon_e = coord_sql("Longitude")
+                    dist_expr = (
+                        f"6371000 * acos(LEAST(1.0, GREATEST(-1.0, "
+                        f"cos(radians({lat_c})) * cos(radians(_lat)) * "
+                        f"cos(radians(_lon) - radians({lon_c})) + "
+                        f"sin(radians({lat_c})) * sin(radians(_lat)))))"
+                    )
+
+                    # --- Diagnóstico do funil de coordenadas (por que sobram poucas?) ---
+                    uso_bool = condicao_extra.strip()
+                    uso_bool = uso_bool[4:] if uso_bool.startswith("AND ") else uso_bool
+                    uso_bool = uso_bool if uso_bool else "TRUE"
+                    try:
+                        q_diag = f"""
+                        WITH parsed AS (
+                            SELECT "Latitude" AS lat_raw, "Longitude" AS lon_raw,
+                                   {lat_e} AS _lat, {lon_e} AS _lon
+                            FROM read_parquet('{PARQUET_GLOB}', union_by_name=true)
+                        )
+                        SELECT
+                          COUNT(*) AS total_geral,
+                          COUNT(*) FILTER (WHERE {uso_bool}) AS total_uso,
+                          COUNT(*) FILTER (WHERE {uso_bool} AND lat_raw IS NOT NULL AND lon_raw IS NOT NULL) AS coord_preenchida,
+                          COUNT(*) FILTER (WHERE {uso_bool} AND _lat IS NOT NULL AND _lon IS NOT NULL) AS coord_valida,
+                          COUNT(*) FILTER (WHERE {uso_bool} AND _lat IS NOT NULL AND _lon IS NOT NULL AND {dist_expr} <= {raio}) AS dentro_raio
+                        FROM parsed
+                        """
+                        diag = duckdb.query(q_diag).df().iloc[0]
+                    except Exception:
+                        diag = None
+
+                    if diag is not None:
+                        with st.expander("🔍 Diagnóstico de cobertura de coordenadas", expanded=True):
+                            d1, d2, d3, d4, d5 = st.columns(5)
+                            d1.metric("Total (uso)", int(diag["total_uso"]))
+                            d2.metric("Coord. preenchida", int(diag["coord_preenchida"]))
+                            d3.metric("Coord. válida", int(diag["coord_valida"]))
+                            d4.metric("Dentro do raio", int(diag["dentro_raio"]))
+                            d5.metric("Base inteira", int(diag["total_geral"]))
+                            preench = int(diag["coord_preenchida"])
+                            valida = int(diag["coord_valida"])
+                            uso = int(diag["total_uso"])
+                            if preench > 0 and valida < preench * 0.9:
+                                st.warning(f"⚠️ {preench - valida} linhas têm coordenada preenchida "
+                                           f"mas **inválida** (provável vírgula decimal não convertida no "
+                                           f"ETL). A conversão blindada desta versão já as recupera no cálculo.")
+                            if uso > 0 and preench < uso * 0.5:
+                                st.warning(f"⚠️ Apenas {preench} de {uso} transações têm coordenada "
+                                           f"preenchida ({preench/uso*100:.0f}%). Isto é **cobertura "
+                                           f"incompleta de geocodificação no ETL** — nenhuma busca por "
+                                           f"raio recupera linhas sem coordenada. Veja a nota ao final.")
+
                     query = f"""
-                    WITH base_distancia AS (
+                    WITH parsed AS (
                         SELECT *,
-                        (6371000 * acos(LEAST(1.0, GREATEST(-1.0,
-                            cos(radians({lat_c})) * cos(radians(TRY_CAST("Latitude" AS DOUBLE))) *
-                            cos(radians(TRY_CAST("Longitude" AS DOUBLE)) - radians({lon_c})) +
-                            sin(radians({lat_c})) * sin(radians(TRY_CAST("Latitude" AS DOUBLE)))
-                        ))) AS dist_metros
+                               {lat_e} AS _lat,
+                               {lon_e} AS _lon
                         FROM read_parquet('{PARQUET_GLOB}', union_by_name=true)
-                        WHERE "Latitude" IS NOT NULL AND "Longitude" IS NOT NULL {condicao_extra}
+                    ),
+                    base_distancia AS (
+                        SELECT *, ({dist_expr}) AS dist_metros
+                        FROM parsed
+                        WHERE _lat IS NOT NULL AND _lon IS NOT NULL {condicao_extra}
                     )
                     SELECT * FROM base_distancia
                     WHERE dist_metros <= {raio}
@@ -314,8 +392,8 @@ if rua or bairro_alvo != "Selecione...":
         df[COL_AREA] = to_num(df, COL_AREA)
         df[COL_TERR] = to_num(df, COL_TERR)
         df[COL_ANO] = to_num(df, COL_ANO)            # <- garante existência; resolve o KeyError
-        df["Latitude"] = to_num(df, "Latitude")
-        df["Longitude"] = to_num(df, "Longitude")
+        df["Latitude"] = get_coord(df, "Latitude", "_lat")
+        df["Longitude"] = get_coord(df, "Longitude", "_lon")
         df["Ano_Transacao"] = to_num(df, "Ano_Transacao")
 
         # 8.2 deriva o ano da transação a partir da data, se necessário
@@ -449,12 +527,21 @@ if rua or bairro_alvo != "Selecione...":
 
         # 9.3 tabela de comparáveis
         st.markdown("### 📋 Transações Comparáveis")
-        df_show = df.drop(columns=["Chave_Imovel"], errors="ignore").copy()
+        df_show = df.drop(columns=["Chave_Imovel", "_lat", "_lon"], errors="ignore").copy()
         if "dist_metros" in df_show.columns:
             df_show = df_show.sort_values("dist_metros")
         else:
             df_show = df_show.sort_values("Preco_m2")
         st.dataframe(df_show, use_container_width=True)
+
+        st.caption(
+            "Nota sobre cobertura: a busca por raio só enxerga transações que "
+            "possuem coordenada. Se o diagnóstico acima mostrar **'Coord. preenchida' "
+            "muito abaixo de 'Total (uso)'**, o gargalo está no ETL (geocodificação "
+            "incompleta), não neste app — é preciso geocodificar mais linhas na base "
+            "(por CEP/logradouro) no Colab. Se 'Coord. válida' estiver abaixo de "
+            "'Coord. preenchida', eram vírgulas decimais não convertidas — já tratadas aqui."
+        )
 
 else:
     st.info("Informe um logradouro (busca por raio/contingência textual) ou selecione um "
