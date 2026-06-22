@@ -95,7 +95,6 @@ if rua or bairro_alvo != "Selecione...":
         
         try:
             if rua:
-                # 1. Rotaciona assinaturas de requisição para mitigar o erro de limite 429
                 rand_id = random.randint(10000, 99999)
                 geolocator = Nominatim(user_agent=f"h2i_valuation_analytics_engine_{rand_id}")
                 endereco_busca = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
@@ -113,7 +112,6 @@ if rua or bairro_alvo != "Selecione...":
                     lat_c, lon_c = loc.latitude, loc.longitude
                     st.success(f"📍 Endereço Alvo Localizado: **{loc.address.split(',')[0]}**")
                     
-                    # Consulta espacial por Haversine nativa da base agregada
                     query = f"""
                     WITH base_distancia AS (
                         SELECT *,
@@ -128,7 +126,6 @@ if rua or bairro_alvo != "Selecione...":
                     """
                     df_bruto = duckdb.query(query).df()
                 
-                # PLANO B (CONTINGÊNCIA ANTIFALHAS)
                 if df_bruto.empty and palavras:
                     if loc:
                         st.info("🔍 Expandindo análise de mercado para abranger a extensão total do logradouro.")
@@ -159,14 +156,18 @@ if rua or bairro_alvo != "Selecione...":
             col_terr = 'Área do Terreno (m2)'
             col_ano = 'Ano_Construcao_Geo'
             
-            for c in [col_val, col_area, col_terr, col_ano, 'Latitude', 'Longitude']:
+            # 🛑 BLINDAGEM CONTRA KEYERROR: Força a existência física de todas as colunas
+            for c in [col_val, col_area, col_terr, col_ano, 'Latitude', 'Longitude', 'Ano_Transacao']:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
+                else:
+                    df[c] = np.nan
             
-            if 'Ano_Transacao' not in df.columns and 'Data de Transação' in df.columns:
+            if pd.isna(df['Ano_Transacao']).all() and 'Data de Transação' in df.columns:
                 df['Ano_Transacao'] = df['Data de Transação'].astype(str).str.extract(r'(\d{4})').astype(float)
             
-            df = df.dropna(subset=[col_val, 'Ano_Transacao', col_area])
+            df = df.dropna(subset=[col_val, col_area])
+            df = df[df['Ano_Transacao'].notna()]
 
             if remover_outliers and not df.empty:
                 df['Preco_m2_Construido'] = df[col_val] / df[col_area]
@@ -177,7 +178,6 @@ if rua or bairro_alvo != "Selecione...":
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
-                # Motor de Identificação de Retrofits
                 chave_col = 'N° do Cadastro (SQL)' if 'N° do Cadastro (SQL)' in df.columns else 'Nome do Logradouro'
                 df['Chave_Imovel'] = df[chave_col].astype(str) + df.get('Número', '').astype(str)
                 
