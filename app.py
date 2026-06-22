@@ -9,6 +9,7 @@ import altair as alt
 import glob
 import numpy as np
 import random
+import unicodedata
 
 # Configuração da página corporativa
 st.set_page_config(page_title="Valuation Home 2 Invest", layout="wide")
@@ -103,7 +104,7 @@ if rua or bairro_alvo != "Selecione...":
                 try:
                     loc = geolocator.geocode(endereco_busca, timeout=8)
                 except Exception:
-                    pass # Captura quedas ou bloqueios de rede sem derrubar o dashboard
+                    pass 
                 
                 palavras = extrair_palavras_chave_rua(rua)
                 cond_rua_textual = " AND ".join([f"UPPER(\"Nome do Logradouro\") LIKE '%{p}%'" for p in palavras]) if palavras else "1=0"
@@ -127,7 +128,7 @@ if rua or bairro_alvo != "Selecione...":
                     """
                     df_bruto = duckdb.query(query).df()
                 
-                # 🛑 PLANO B (CONTINGÊNCIA ANTIFALHAS): Ativado em caso de erro 429 ou raio sem resultados georreferenciados
+                # PLANO B (CONTINGÊNCIA ANTIFALHAS)
                 if df_bruto.empty and palavras:
                     if loc:
                         st.info("🔍 Expandindo análise de mercado para abranger a extensão total do logradouro.")
@@ -176,6 +177,7 @@ if rua or bairro_alvo != "Selecione...":
                 df = df.drop(columns=['Preco_m2_Construido'])
 
             if not df.empty:
+                # Motor de Identificação de Retrofits
                 chave_col = 'N° do Cadastro (SQL)' if 'N° do Cadastro (SQL)' in df.columns else 'Nome do Logradouro'
                 df['Chave_Imovel'] = df[chave_col].astype(str) + df.get('Número', '').astype(str)
                 
