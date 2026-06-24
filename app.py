@@ -303,7 +303,7 @@ if rua or bairro_alvo != "Selecione...":
                         diag = None
 
                     if diag is not None:
-                        with st.expander("🔍 Diagnóstico de cobertura de coordenadas", expanded=True):
+                        with st.expander("🔍 Diagnóstico de cobertura de coordenadas", expanded=False):
                             d1, d2, d3, d4, d5 = st.columns(5)
                             d1.metric("Total (uso)", int(diag["total_uso"]))
                             d2.metric("Coord. preenchida", int(diag["coord_preenchida"]))
@@ -321,7 +321,7 @@ if rua or bairro_alvo != "Selecione...":
                                 st.warning(f"⚠️ Apenas {preench} de {uso} transações têm coordenada "
                                            f"preenchida ({preench/uso*100:.0f}%). Isto é **cobertura "
                                            f"incompleta de geocodificação no ETL** — nenhuma busca por "
-                                           f"raio recupera linhas sem coordenada. Veja a nota ao final.")
+                                           f"raio recupera linhas sem coordenada.")
 
                     query = f"""
                     WITH parsed AS (
@@ -430,38 +430,41 @@ if rua or bairro_alvo != "Selecione...":
             st.warning("Nenhum imóvel restou após o filtro de outliers (IQR).")
             st.stop()
 
-        # 8.7 categorização (à prova de colunas/valores ausentes)
-        chave_col = (COL_SQL if COL_SQL in df.columns
-                     else (COL_LOGR if COL_LOGR in df.columns else None))
+        # 8.7 classificação Modernizado x Antigo
+        #     Regra 1 (principal): ano de construção (Ano_Construcao_Geo) >= 2018.
+        #              O valor 0 significa "desconhecido": não é tratado como
+        #              antigo automaticamente — nesse caso decide a Regra 2.
+        #     Regra 2 (retrofit): a área construída AUMENTOU de forma relevante
+        #              ao longo do tempo no MESMO imóvel (mesmo SQL) — ampliação.
+        #              Critério estrito para não inflar a categoria: ganho de
+        #              área > 20% E > 15 m² entre a transação mais antiga e a
+        #              mais recente do mesmo SQL.
+        chave_col = COL_SQL if COL_SQL in df.columns else None
         if chave_col is None:
             df["Chave_Imovel"] = df.index.astype(str)
         else:
-            df["Chave_Imovel"] = col_as_str(df, chave_col) + "_" + col_as_str(df, COL_NUM)
+            df["Chave_Imovel"] = col_as_str(df, chave_col)
 
-        grp = df.groupby("Chave_Imovel")[COL_AREA]
-        df["Max_Area_Historica"] = grp.transform("max")
-        df["Min_Area_Historica"] = grp.transform("min")
-        df["Qtd_Areas_Unicas"] = grp.transform("nunique")
-        df["Houve_Expansao"] = (
-            (df["Qtd_Areas_Unicas"] > 1)
-            & ((df["Max_Area_Historica"] - df["Min_Area_Historica"]) > 10)
-        )
+        regra_area = pd.Series(False, index=df.index)
+        if "Ano_Transacao" in df.columns and df.groupby("Chave_Imovel").ngroups < len(df):
+            # ordena por ano e compara área da 1ª x última transação de cada imóvel
+            tmp = df[["Chave_Imovel", "Ano_Transacao", COL_AREA]].copy()
+            tmp = tmp.sort_values(["Chave_Imovel", "Ano_Transacao"])
+            primeira = tmp.groupby("Chave_Imovel")[COL_AREA].first()
+            ultima = tmp.groupby("Chave_Imovel")[COL_AREA].last()
+            ganho_abs = (ultima - primeira)
+            ganho_rel = ganho_abs / primeira.replace(0, np.nan)
+            ampliou = (ganho_abs > 15) & (ganho_rel > 0.20)
+            chaves_retrofit = set(ampliou[ampliou.fillna(False)].index)
+            regra_area = df["Chave_Imovel"].isin(chaves_retrofit)
 
-        # condlist explicitamente em ndarray booleano (resolve o "invalid entry in condlist")
-        c1 = (df[COL_ANO].fillna(0) >= 2018).to_numpy(dtype=bool)
-        c2_series = df["Houve_Expansao"].fillna(False) & (df[COL_AREA] == df["Max_Area_Historica"])
-        c2 = c2_series.fillna(False).to_numpy(dtype=bool)
-        df["Categoria"] = np.select(
-            [c1, c2],
-            ["Modernizado (≥ 2018)", "Retrofit (Expansão)"],
-            default="Antigo",
-        )
+        ano_constr = df[COL_ANO].fillna(0)
+        regra_ano = ano_constr >= 2018
 
-        df = df.drop(
-            columns=["Max_Area_Historica", "Min_Area_Historica",
-                     "Qtd_Areas_Unicas", "Houve_Expansao"],
-            errors="ignore",
-        )
+        eh_modernizado = (regra_ano | regra_area.fillna(False)).to_numpy(dtype=bool)
+        df["Status"] = np.where(eh_modernizado, "Modernizado", "Antigo")
+
+        df = df.drop(columns=["Chave_Imovel"], errors="ignore")
 
         # --------------------------------------------------------------------
         # 9. SAÍDAS
@@ -471,10 +474,7 @@ if rua or bairro_alvo != "Selecione...":
         m1.metric("Amostras Resgatadas", len(df))
         m2.metric("Mediana R$/m²", formata_moeda(df["Preco_m2"].median()))
         m3.metric("Média R$/m²", formata_moeda(df["Preco_m2"].mean()))
-        m4.metric(
-            "Faixa R$/m²",
-            f'{formata_moeda(df["Preco_m2"].min())} — {formata_moeda(df["Preco_m2"].max())}',
-        )
+        m4.metric("% Modernizados", f'{(df["Status"] == "Modernizado").mean() * 100:.0f}%')
 
         # 9.1 mapa
         df_geo = df.dropna(subset=["Latitude", "Longitude"])
@@ -491,18 +491,16 @@ if rua or bairro_alvo != "Selecione...":
                 folium.Circle([lat_c, lon_c], radius=raio, color="#1f77b4",
                               fill=True, fill_opacity=0.05).add_to(m)
 
-            cores = {"Modernizado (≥ 2018)": "green",
-                     "Retrofit (Expansão)": "orange",
-                     "Antigo": "blue"}
+            cores = {"Modernizado": "green", "Antigo": "blue"}
             camada = MarkerCluster().add_to(m) if HAS_CLUSTER else m
             for _, r in df_geo.iterrows():
                 popup = (f"<b>R$/m²:</b> {formata_moeda(r['Preco_m2'])}<br>"
                          f"<b>Valor:</b> {formata_moeda(r[COL_VAL])}<br>"
                          f"<b>Área:</b> {r[COL_AREA]:.0f} m²<br>"
-                         f"<b>Categoria:</b> {r['Categoria']}")
+                         f"<b>Status:</b> {r['Status']}")
                 folium.CircleMarker(
                     [r["Latitude"], r["Longitude"]], radius=5,
-                    color=cores.get(r["Categoria"], "gray"),
+                    color=cores.get(r["Status"], "gray"),
                     fill=True, fill_opacity=0.85,
                     popup=folium.Popup(popup, max_width=260),
                 ).add_to(camada)
@@ -511,37 +509,62 @@ if rua or bairro_alvo != "Selecione...":
             st.info("ℹ️ Sem coordenadas válidas nesta amostra (modo textual) — mapa "
                     "indisponível, mas o histórico abaixo é válido.")
 
-        # 9.2 distribuição de preço/m²
-        st.markdown("### 📈 Distribuição de Preço/m²")
-        chart = (
-            alt.Chart(df)
-            .mark_bar()
-            .encode(
-                x=alt.X("Preco_m2:Q", bin=alt.Bin(maxbins=30), title="Preço por m² (R$)"),
-                y=alt.Y("count()", title="Nº de transações"),
-                tooltip=[alt.Tooltip("count()", title="Transações")],
-            )
-            .properties(height=260)
+        # 9.2 GRÁFICO PRINCIPAL: Preço/m² Modernizado x Antigo por faixa de área construída
+        st.markdown("### 📈 Preço/m² construído — Modernizado × Antigo por faixa de área")
+
+        bins = [0, 300, 400, 500, 600, 700, 800, np.inf]
+        labels = ["<300", "300–400", "400–500", "500–600", "600–700", "700–800", ">800"]
+        df["Faixa_Area"] = pd.cut(df[COL_AREA], bins=bins, labels=labels, right=False)
+
+        ag = (
+            df.dropna(subset=["Faixa_Area"])
+            .groupby(["Faixa_Area", "Status"], observed=True)
+            .agg(preco_m2=("Preco_m2", "median"), n=("Preco_m2", "size"))
+            .reset_index()
         )
-        st.altair_chart(chart, use_container_width=True)
+
+        if ag.empty:
+            st.info("Sem dados suficientes nesta região para montar o gráfico.")
+        else:
+            chart = (
+                alt.Chart(ag)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Faixa_Area:N", sort=labels,
+                            title="Faixa de área construída (m²)"),
+                    xOffset=alt.XOffset("Status:N"),
+                    y=alt.Y("preco_m2:Q", title="Mediana do preço/m² (R$)"),
+                    color=alt.Color(
+                        "Status:N",
+                        scale=alt.Scale(domain=["Antigo", "Modernizado"],
+                                        range=["#9aa0a6", "#1a9850"]),
+                        title="",
+                    ),
+                    tooltip=[
+                        alt.Tooltip("Faixa_Area:N", title="Faixa"),
+                        alt.Tooltip("Status:N", title="Tipo"),
+                        alt.Tooltip("preco_m2:Q", title="Mediana R$/m²", format=",.0f"),
+                        alt.Tooltip("n:Q", title="Nº transações"),
+                    ],
+                )
+                .properties(height=380)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+            with st.expander("Ver nº de transações por faixa (cuidado com amostras pequenas)"):
+                tabela = (ag.pivot_table(index="Faixa_Area", columns="Status",
+                                         values="n", observed=True)
+                          .reindex(labels).fillna(0).astype(int))
+                st.dataframe(tabela, use_container_width=True)
 
         # 9.3 tabela de comparáveis
         st.markdown("### 📋 Transações Comparáveis")
-        df_show = df.drop(columns=["Chave_Imovel", "_lat", "_lon"], errors="ignore").copy()
+        df_show = df.drop(columns=["_lat", "_lon", "Faixa_Area"], errors="ignore").copy()
         if "dist_metros" in df_show.columns:
             df_show = df_show.sort_values("dist_metros")
         else:
             df_show = df_show.sort_values("Preco_m2")
         st.dataframe(df_show, use_container_width=True)
-
-        st.caption(
-            "Nota sobre cobertura: a busca por raio só enxerga transações que "
-            "possuem coordenada. Se o diagnóstico acima mostrar **'Coord. preenchida' "
-            "muito abaixo de 'Total (uso)'**, o gargalo está no ETL (geocodificação "
-            "incompleta), não neste app — é preciso geocodificar mais linhas na base "
-            "(por CEP/logradouro) no Colab. Se 'Coord. válida' estiver abaixo de "
-            "'Coord. preenchida', eram vírgulas decimais não convertidas — já tratadas aqui."
-        )
 
 else:
     st.info("Informe um logradouro (busca por raio/contingência textual) ou selecione um "
