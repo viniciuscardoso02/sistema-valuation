@@ -271,6 +271,21 @@ ano_min, ano_max = st.sidebar.slider(
     value=(2010, date.today().year),
 )
 
+st.sidebar.markdown("**Filtro por área (alvo ± margem)**")
+MARGEM = 0.20  # ±20% em torno do valor digitado
+area_constr_alvo = st.sidebar.number_input(
+    "Área construída alvo (m²) — 0 = sem filtro", min_value=0, value=0, step=10,
+)
+area_terr_alvo = st.sidebar.number_input(
+    "Área de terreno alvo (m²) — 0 = sem filtro", min_value=0, value=0, step=10,
+)
+if area_constr_alvo > 0:
+    st.sidebar.caption(f"↳ Construída: {area_constr_alvo*(1-MARGEM):.0f}–"
+                       f"{area_constr_alvo*(1+MARGEM):.0f} m²")
+if area_terr_alvo > 0:
+    st.sidebar.caption(f"↳ Terreno: {area_terr_alvo*(1-MARGEM):.0f}–"
+                       f"{area_terr_alvo*(1+MARGEM):.0f} m²")
+
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
 remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
@@ -477,6 +492,18 @@ if rua or distrito_alvo != "Selecione...":
         df = df[(df["Ano_Transacao"] >= ano_min) & (df["Ano_Transacao"] <= ano_max)]
         if df.empty:
             st.warning("Nenhuma transação dentro do período selecionado.")
+            st.stop()
+
+        # 8.4b filtro por área (alvo ± margem de 20%) — construída e/ou terreno
+        if area_constr_alvo > 0:
+            lo_c, hi_c = area_constr_alvo * (1 - MARGEM), area_constr_alvo * (1 + MARGEM)
+            df = df[df[COL_AREA].between(lo_c, hi_c)]
+        if area_terr_alvo > 0 and COL_TERR in df.columns:
+            lo_t, hi_t = area_terr_alvo * (1 - MARGEM), area_terr_alvo * (1 + MARGEM)
+            df = df[df[COL_TERR].between(lo_t, hi_t)]
+        if df.empty:
+            st.warning("Nenhuma transação dentro das faixas de área selecionadas. "
+                       "Tente alargar a margem ou ajustar os alvos.")
             st.stop()
 
         # 8.5 preço por m² construído (e de terreno, para o mapa de calor)
