@@ -47,6 +47,12 @@ try:
 except Exception:
     HAS_CLUSTER = False
 
+try:
+    from folium.plugins import HeatMap
+    HAS_HEATMAP = True
+except Exception:
+    HAS_HEATMAP = False
+
 
 # ============================================================================
 # 1. CONFIGURAÇÃO E LOCALIZAÇÃO DOS DADOS
@@ -269,6 +275,15 @@ st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
 remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
 
+st.sidebar.markdown("---")
+st.sidebar.header("🔥 Mapa de Calor")
+heatmap_modo = st.sidebar.radio(
+    "Camada de calor no mapa",
+    ["Desligado", "Densidade de transações", "Preço/m² de terreno"],
+    help=("Densidade: regiões com mais transações ficam quentes. "
+          "Preço/m² de terreno: regiões mais caras ficam quentes (ponderado pelo valor)."),
+)
+
 
 # ============================================================================
 # 6. CONSTRUÇÃO DO FILTRO DE USO (defensivo)
@@ -464,8 +479,11 @@ if rua or distrito_alvo != "Selecione...":
             st.warning("Nenhuma transação dentro do período selecionado.")
             st.stop()
 
-        # 8.5 preço por m² construído
+        # 8.5 preço por m² construído (e de terreno, para o mapa de calor)
         df["Preco_m2"] = df[COL_VAL] / df[COL_AREA]
+        df["Preco_m2_Terreno"] = np.where(
+            df[COL_TERR] > 0, df[COL_VAL] / df[COL_TERR], np.nan
+        )
 
         # 8.6 remoção de outliers (IQR) — aplicada sobre os comparáveis do período
         if remover_outliers and len(df) >= 4:
@@ -598,6 +616,36 @@ if rua or distrito_alvo != "Selecione...":
                     fill=True, fill_opacity=0.85,
                     popup=folium.Popup(popup, max_width=260),
                 ).add_to(camada)
+
+            # --- Camada de mapa de calor (opcional) ---
+            if heatmap_modo != "Desligado" and HAS_HEATMAP:
+                if heatmap_modo == "Densidade de transações":
+                    # cada transação pesa igual -> regiões com mais negócios ficam quentes
+                    pontos = df_geo[["Latitude", "Longitude"]].values.tolist()
+                    if pontos:
+                        HeatMap(pontos, radius=18, blur=22, min_opacity=0.3,
+                                name="Densidade").add_to(m)
+                else:
+                    # Preço/m² de terreno -> ponderado pelo valor (regiões caras ficam quentes)
+                    h = df_geo.dropna(subset=["Preco_m2_Terreno"]).copy()
+                    h = h[h["Preco_m2_Terreno"] > 0]
+                    if not h.empty:
+                        # remove extremos do peso (p5–p95) para a escala de cor não saturar
+                        lo, hi = h["Preco_m2_Terreno"].quantile([0.05, 0.95])
+                        if hi <= lo:
+                            hi = h["Preco_m2_Terreno"].max()
+                            lo = h["Preco_m2_Terreno"].min()
+                        peso = ((h["Preco_m2_Terreno"].clip(lo, hi) - lo) / (hi - lo)) \
+                            if hi > lo else 1.0
+                        h = h.assign(_peso=peso)
+                        pontos = h[["Latitude", "Longitude", "_peso"]].values.tolist()
+                        HeatMap(pontos, radius=20, blur=25, min_opacity=0.25,
+                                name="Preço/m² terreno").add_to(m)
+                        st.caption("🔥 Mapa de calor por **preço/m² de terreno**: tons quentes "
+                                   "indicam terreno mais caro na região. Apartamentos têm área "
+                                   "de terreno fracionada e podem distorcer — filtre por "
+                                   "'Residenciais' para uma leitura mais limpa.")
+
             render_map(m)
         else:
             st.info("ℹ️ Sem coordenadas válidas nesta amostra (modo textual) — mapa "
