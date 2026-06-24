@@ -75,7 +75,7 @@ COL_ANO = "Ano_Construcao_Geo"
 COL_USO = "Descrição do uso (IPTU)"
 COL_LOGR = "Nome do Logradouro"
 COL_NUM = "Número"
-COL_BAIRRO = "Bairro"
+COL_DISTRITO = "Distrito"
 COL_DATA = "Data de Transação"
 COL_SQL = "N° do Cadastro (SQL)"
 
@@ -177,23 +177,23 @@ def get_coord(df, name, parsed_name):
 
 
 # ============================================================================
-# 4. LISTA DE BAIRROS
+# 4. LISTA DE DISTRITOS
 # ============================================================================
 @st.cache_data(show_spinner=False)
-def carregar_lista_bairros(glob_path):
-    if COL_BAIRRO not in get_available_columns(glob_path):
+def carregar_lista_distritos(glob_path):
+    if COL_DISTRITO not in get_available_columns(glob_path):
         return ["Selecione..."]
     try:
-        q = (f'SELECT DISTINCT "{COL_BAIRRO}" AS b '
+        q = (f'SELECT DISTINCT "{COL_DISTRITO}" AS d '
              f"FROM read_parquet('{glob_path}', union_by_name=true) "
-             f'WHERE "{COL_BAIRRO}" IS NOT NULL')
-        df_b = duckdb.query(q).df()
-        return ["Selecione..."] + sorted(df_b["b"].astype(str).unique())
+             f'WHERE "{COL_DISTRITO}" IS NOT NULL')
+        df_d = duckdb.query(q).df()
+        return ["Selecione..."] + sorted(df_d["d"].astype(str).unique())
     except Exception:
         return ["Selecione..."]
 
 
-bairros_disp = carregar_lista_bairros(PARQUET_GLOB)
+distritos_disp = carregar_lista_distritos(PARQUET_GLOB)
 
 
 # ============================================================================
@@ -205,7 +205,7 @@ num = st.sidebar.text_input("Número (Opcional)")
 raio = st.sidebar.slider("Raio de busca vizinhança (metros)", 100, 2500, 500)
 
 st.sidebar.markdown("**OU**")
-bairro_alvo = st.sidebar.selectbox("Buscar por Bairro Inteiro", bairros_disp)
+distrito_alvo = st.sidebar.selectbox("Buscar por Distrito Inteiro", distritos_disp)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 Filtros de Ativo")
@@ -245,7 +245,7 @@ def run_query(sql):
     return duckdb.query(sql).df()
 
 
-if rua or bairro_alvo != "Selecione...":
+if rua or distrito_alvo != "Selecione...":
     with st.spinner("Compilando histórico e aplicando regras de inteligência imobiliária..."):
 
         df_bruto = pd.DataFrame()
@@ -364,15 +364,15 @@ if rua or bairro_alvo != "Selecione...":
                         st.warning("Base sem coordenadas e sem termos de busca válidos no logradouro.")
 
             else:
-                # 7.4 busca por bairro
-                if has(COL_BAIRRO):
+                # 7.4 busca por distrito
+                if has(COL_DISTRITO):
                     query = f"""
                     SELECT * FROM read_parquet('{PARQUET_GLOB}', union_by_name=true)
-                    WHERE "{COL_BAIRRO}" = '{sql_str(bairro_alvo)}' {condicao_extra}
+                    WHERE "{COL_DISTRITO}" = '{sql_str(distrito_alvo)}' {condicao_extra}
                     """
                     df_bruto = run_query(query)
                 else:
-                    st.warning("A base não possui coluna de Bairro.")
+                    st.warning("A base não possui coluna de Distrito.")
 
         except Exception as e:
             st.error(f"Erro no processamento da consulta: {e}")
@@ -568,4 +568,4 @@ if rua or bairro_alvo != "Selecione...":
 
 else:
     st.info("Informe um logradouro (busca por raio/contingência textual) ou selecione um "
-            "bairro na barra lateral para iniciar a análise.")
+            "distrito na barra lateral para iniciar a análise.")
