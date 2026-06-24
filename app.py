@@ -196,6 +196,55 @@ def carregar_lista_distritos(glob_path):
 distritos_disp = carregar_lista_distritos(PARQUET_GLOB)
 
 
+# Caminho do GeoJSON de distritos (para desenhar o contorno no mapa)
+GEOJSON_DISTRITOS = os.path.join(APP_DIR, "distritos_sp.geojson")
+if not os.path.exists(GEOJSON_DISTRITOS):
+    GEOJSON_DISTRITOS = "distritos_sp.geojson"
+
+
+@st.cache_data(show_spinner=False)
+def carregar_geojson_distritos(caminho):
+    """Carrega o GeoJSON dos distritos uma vez. Retorna dict {nome: feature} e o
+    FeatureCollection completo. Se o arquivo não existir, retorna (None, None)."""
+    try:
+        import json
+        with open(caminho, "r", encoding="utf-8") as fh:
+            fc = json.load(fh)
+        por_nome = {}
+        for feat in fc.get("features", []):
+            nome = feat.get("properties", {}).get("Distrito")
+            if nome:
+                por_nome[str(nome)] = feat
+        return por_nome, fc
+    except Exception:
+        return None, None
+
+
+DISTRITOS_GEO, _ = carregar_geojson_distritos(GEOJSON_DISTRITOS)
+
+
+def centroide_distrito(feature):
+    """Centro aproximado de um polígono (média dos vértices), sem depender de libs geo."""
+    try:
+        coords = []
+        geom = feature["geometry"]
+        partes = geom["coordinates"]
+        # MultiPolygon -> lista de polígonos; Polygon -> lista de anéis
+        anel_iter = partes if geom["type"] == "MultiPolygon" else [partes]
+        for poly in anel_iter:
+            ext = poly[0] if geom["type"] == "MultiPolygon" else poly
+            for ring in ([ext] if geom["type"] == "MultiPolygon" else partes):
+                for x, y in ring:
+                    coords.append((x, y))
+        if not coords:
+            return None
+        lon = sum(c[0] for c in coords) / len(coords)
+        lat = sum(c[1] for c in coords) / len(coords)
+        return [lat, lon]
+    except Exception:
+        return None
+
+
 # ============================================================================
 # 5. SIDEBAR
 # ============================================================================
@@ -479,21 +528,66 @@ if rua or distrito_alvo != "Selecione...":
         # 9.1 mapa
         df_geo = df.dropna(subset=["Latitude", "Longitude"])
         df_geo = df_geo[df_geo["Latitude"].between(-90, 90) & df_geo["Longitude"].between(-180, 180)]
+
+        # modo de busca: True quando o usuário escolheu um distrito (sem logradouro)
+        modo_distrito = (not rua) and (distrito_alvo != "Selecione...")
+
         if not df_geo.empty:
             st.markdown("### 🗺️ Distribuição Geográfica")
-            centro = [lat_c, lon_c] if (lat_c and lon_c) else \
-                     [df_geo["Latitude"].mean(), df_geo["Longitude"].mean()]
-            m = folium.Map(location=centro, zoom_start=15, tiles="CartoDB positron")
 
+            feature_dist = None
+            if modo_distrito and DISTRITOS_GEO is not None:
+                feature_dist = DISTRITOS_GEO.get(str(distrito_alvo))
+
+            # centro do mapa: ponto do endereço (raio) OU centroide do distrito OU média dos pontos
+            if lat_c and lon_c:
+                centro = [lat_c, lon_c]
+            elif feature_dist is not None:
+                centro = centroide_distrito(feature_dist) or \
+                         [df_geo["Latitude"].mean(), df_geo["Longitude"].mean()]
+            else:
+                centro = [df_geo["Latitude"].mean(), df_geo["Longitude"].mean()]
+
+            zoom = 13 if modo_distrito else 15
+            m = folium.Map(location=centro, zoom_start=zoom, tiles="CartoDB positron")
+
+            # modo raio: marcador alvo + círculo
             if lat_c and lon_c:
                 folium.Marker([lat_c, lon_c], tooltip="Endereço Alvo",
                               icon=folium.Icon(color="red", icon="star")).add_to(m)
                 folium.Circle([lat_c, lon_c], radius=raio, color="#1f77b4",
                               fill=True, fill_opacity=0.05).add_to(m)
 
+            # modo distrito: contorno do polígono
+            if feature_dist is not None:
+                folium.GeoJson(
+                    feature_dist,
+                    name=str(distrito_alvo),
+                    style_function=lambda _: {
+                        "color": "#d62728", "weight": 3,
+                        "fill": True, "fillColor": "#d62728", "fillOpacity": 0.07,
+                    },
+                    tooltip=str(distrito_alvo),
+                ).add_to(m)
+                try:
+                    m.fit_bounds(folium.GeoJson(feature_dist).get_bounds())
+                except Exception:
+                    pass
+
             cores = {"Modernizado": "green", "Antigo": "blue"}
             camada = MarkerCluster().add_to(m) if HAS_CLUSTER else m
-            for _, r in df_geo.iterrows():
+
+            # guarda de desempenho: acima do limite, plota uma amostra no MAPA
+            # (métricas, gráfico e tabela continuam usando TODAS as transações)
+            MAX_PINS_MAPA = 15000
+            df_map = df_geo
+            if len(df_geo) > MAX_PINS_MAPA:
+                df_map = df_geo.sample(MAX_PINS_MAPA, random_state=1)
+                st.caption(f"🗺️ O mapa mostra {MAX_PINS_MAPA:,} pinos de "
+                           f"{len(df_geo):,} (amostra, para não travar o navegador). "
+                           f"As métricas, o gráfico e a tabela usam todas as transações.")
+
+            for _, r in df_map.iterrows():
                 popup = (f"<b>R$/m²:</b> {formata_moeda(r['Preco_m2'])}<br>"
                          f"<b>Valor:</b> {formata_moeda(r[COL_VAL])}<br>"
                          f"<b>Área:</b> {r[COL_AREA]:.0f} m²<br>"
