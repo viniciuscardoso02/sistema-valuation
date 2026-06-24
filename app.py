@@ -561,14 +561,77 @@ if rua or distrito_alvo != "Selecione...":
         df = df.drop(columns=["Chave_Imovel"], errors="ignore")
 
         # --------------------------------------------------------------------
-        # 9. SAÍDAS
+        # 9. SAÍDAS — RELATÓRIO DE AVALIAÇÃO
         # --------------------------------------------------------------------
-        st.markdown("### 📊 Resumo do Valuation")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Amostras Resgatadas", len(df))
-        m2.metric("Mediana R$/m²", formata_moeda(df["Preco_m2"].median()))
-        m3.metric("Média R$/m²", formata_moeda(df["Preco_m2"].mean()))
-        m4.metric("% Modernizados", f'{(df["Status"] == "Modernizado").mean() * 100:.0f}%')
+        # Preço/m² de terreno só faz sentido onde há área de terreno
+        terreno_valido = df["Preco_m2_Terreno"].dropna()
+        terreno_valido = terreno_valido[terreno_valido > 0]
+
+        # Percentis P10–P90 do R$/m² (faixa) e média (valor de referência)
+        p10_c, p90_c = df["Preco_m2"].quantile([0.10, 0.90])
+        media_c = df["Preco_m2"].mean()
+        if not terreno_valido.empty:
+            p10_t, p90_t = terreno_valido.quantile([0.10, 0.90])
+            media_t = terreno_valido.mean()
+        else:
+            p10_t = p90_t = media_t = np.nan
+
+        # cabeçalho do relatório
+        contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
+        st.markdown("## 📑 Relatório de Avaliação Imobiliária")
+        st.markdown(f"**{contexto}**  ·  {len(df):,} transações comparáveis analisadas")
+
+        # ---- FAIXA DE VALOR ESTIMADA (só quando a pessoa digitou a área) ----
+        faixas_estimadas = []  # cada item: (rótulo, valor_min, valor_max)
+
+        if area_constr_alvo > 0:
+            vmin_c = p10_c * area_constr_alvo
+            vmax_c = p90_c * area_constr_alvo
+            faixas_estimadas.append(("Construção", vmin_c, vmax_c))
+
+        if area_terr_alvo > 0 and not np.isnan(p10_t):
+            vmin_t = p10_t * area_terr_alvo
+            vmax_t = p90_t * area_terr_alvo
+            faixas_estimadas.append(("Terreno", vmin_t, vmax_t))
+
+        if faixas_estimadas:
+            st.markdown("### 💰 Faixa de valor estimada para o imóvel")
+
+            # média das faixas disponíveis (se houver as duas, faz a média; se uma só, usa ela)
+            vmin_final = np.mean([f[1] for f in faixas_estimadas])
+            vmax_final = np.mean([f[2] for f in faixas_estimadas])
+
+            cprinc1, cprinc2 = st.columns(2)
+            cprinc1.metric("Valor estimado — mínimo", formata_moeda(vmin_final))
+            cprinc2.metric("Valor estimado — máximo", formata_moeda(vmax_final))
+
+            # detalhamento por base (construção / terreno)
+            with st.expander("Como esta faixa foi calculada"):
+                for rotulo, vmn, vmx in faixas_estimadas:
+                    area_ref = area_constr_alvo if rotulo == "Construção" else area_terr_alvo
+                    st.markdown(
+                        f"- **{rotulo}** ({area_ref:.0f} m²): "
+                        f"{formata_moeda(vmn)} a {formata_moeda(vmx)}"
+                    )
+                if len(faixas_estimadas) == 2:
+                    st.markdown("- **Faixa final** = média das faixas de construção e terreno.")
+                st.caption("Limites calculados pelos percentis P10 e P90 do preço/m² dos "
+                           "comparáveis (faixa onde está a maioria dos imóveis, excluindo extremos).")
+        else:
+            st.info("💡 Informe a **área construída** e/ou **área de terreno** na barra lateral "
+                    "para obter a faixa de valor estimada do imóvel.")
+
+        # ---- INDICADORES DE MERCADO (sempre por MÉDIA) ----
+        st.markdown("### 📊 Indicadores de mercado (R$/m²)")
+        i1, i2, i3 = st.columns(3)
+        i1.metric("Transações", f"{len(df):,}")
+        i2.metric("Média R$/m² construção", formata_moeda(media_c))
+        i3.metric("Média R$/m² terreno",
+                  formata_moeda(media_t) if not np.isnan(media_t) else "—")
+        j1, j2 = st.columns(2)
+        j1.metric("% Modernizados", f'{(df["Status"] == "Modernizado").mean() * 100:.0f}%')
+        j2.metric("Faixa construção P10–P90/m²",
+                  f"{formata_moeda(p10_c)} — {formata_moeda(p90_c)}")
 
         # 9.1 mapa
         df_geo = df.dropna(subset=["Latitude", "Longitude"])
@@ -688,7 +751,7 @@ if rua or distrito_alvo != "Selecione...":
         ag = (
             df.dropna(subset=["Faixa_Area"])
             .groupby(["Faixa_Area", "Status"], observed=True)
-            .agg(preco_m2=("Preco_m2", "median"), n=("Preco_m2", "size"))
+            .agg(preco_m2=("Preco_m2", "mean"), n=("Preco_m2", "size"))
             .reset_index()
         )
 
@@ -702,7 +765,7 @@ if rua or distrito_alvo != "Selecione...":
                     x=alt.X("Faixa_Area:N", sort=labels,
                             title="Faixa de área construída (m²)"),
                     xOffset=alt.XOffset("Status:N"),
-                    y=alt.Y("preco_m2:Q", title="Mediana do preço/m² (R$)"),
+                    y=alt.Y("preco_m2:Q", title="Média do preço/m² (R$)"),
                     color=alt.Color(
                         "Status:N",
                         scale=alt.Scale(domain=["Antigo", "Modernizado"],
@@ -712,7 +775,7 @@ if rua or distrito_alvo != "Selecione...":
                     tooltip=[
                         alt.Tooltip("Faixa_Area:N", title="Faixa"),
                         alt.Tooltip("Status:N", title="Tipo"),
-                        alt.Tooltip("preco_m2:Q", title="Mediana R$/m²", format=",.0f"),
+                        alt.Tooltip("preco_m2:Q", title="Média R$/m²", format=",.0f"),
                         alt.Tooltip("n:Q", title="Nº transações"),
                     ],
                 )
