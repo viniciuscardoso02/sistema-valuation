@@ -289,6 +289,12 @@ if area_terr_alvo > 0:
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Configurações Avançadas")
 remover_outliers = st.sidebar.toggle("Remover Outliers (Método IQR)", value=True)
+filtro_status = st.sidebar.radio(
+    "Mostrar imóveis",
+    ["Todos", "Só modernizados", "Só antigos"],
+    help=("Modernizado = ano de construção ≥ 2018 OU ampliação de área no mesmo "
+          "imóvel. Filtra as transações exibidas em todo o relatório."),
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔥 Mapa de Calor")
@@ -560,6 +566,15 @@ if rua or distrito_alvo != "Selecione...":
 
         df = df.drop(columns=["Chave_Imovel"], errors="ignore")
 
+        # 8.8 filtro de status (Todos / Só modernizados / Só antigos)
+        if filtro_status == "Só modernizados":
+            df = df[df["Status"] == "Modernizado"]
+        elif filtro_status == "Só antigos":
+            df = df[df["Status"] == "Antigo"]
+        if df.empty:
+            st.warning(f"Nenhuma transação na categoria '{filtro_status}' para este recorte.")
+            st.stop()
+
         # --------------------------------------------------------------------
         # 9. SAÍDAS — RELATÓRIO DE AVALIAÇÃO
         # --------------------------------------------------------------------
@@ -788,6 +803,45 @@ if rua or distrito_alvo != "Selecione...":
                                          values="n", observed=True)
                           .reindex(labels).fillna(0).astype(int))
                 st.dataframe(tabela, use_container_width=True)
+
+        # 9.2b GRÁFICO: evolução do R$/m² médio por ano da transação (Modernizado × Antigo)
+        st.markdown("### 📉 Evolução do R$/m² médio por ano da transação")
+        serie = df.dropna(subset=["Ano_Transacao", "Preco_m2"]).copy()
+        serie["Ano"] = serie["Ano_Transacao"].astype(int)
+        evol = (
+            serie.groupby(["Ano", "Status"], observed=True)
+            .agg(preco_m2=("Preco_m2", "mean"), n=("Preco_m2", "size"))
+            .reset_index()
+        )
+        # evita linhas tremidas por anos com pouquíssimas transações
+        evol = evol[evol["n"] >= 3]
+
+        if evol.empty or evol["Ano"].nunique() < 2:
+            st.info("Dados insuficientes para traçar a evolução por ano neste recorte "
+                    "(é preciso pelo menos 2 anos com amostra suficiente).")
+        else:
+            linha = (
+                alt.Chart(evol)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("Ano:O", title="Ano da transação"),
+                    y=alt.Y("preco_m2:Q", title="Média do preço/m² construído (R$)"),
+                    color=alt.Color(
+                        "Status:N",
+                        scale=alt.Scale(domain=["Antigo", "Modernizado"],
+                                        range=["#9aa0a6", "#1a9850"]),
+                        title="",
+                    ),
+                    tooltip=[
+                        alt.Tooltip("Ano:O", title="Ano"),
+                        alt.Tooltip("Status:N", title="Tipo"),
+                        alt.Tooltip("preco_m2:Q", title="Média R$/m²", format=",.0f"),
+                        alt.Tooltip("n:Q", title="Nº transações"),
+                    ],
+                )
+                .properties(height=340)
+            )
+            st.altair_chart(linha, use_container_width=True)
 
         # 9.3 tabela de comparáveis
         st.markdown("### 📋 Transações Comparáveis")
