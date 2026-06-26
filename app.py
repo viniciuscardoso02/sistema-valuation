@@ -582,14 +582,14 @@ if rua or distrito_alvo != "Selecione...":
         terreno_valido = df["Preco_m2_Terreno"].dropna()
         terreno_valido = terreno_valido[terreno_valido > 0]
 
-        # Percentis P10–P90 do R$/m² (faixa) e média (valor de referência)
-        p10_c, p90_c = df["Preco_m2"].quantile([0.10, 0.90])
+        # Mínimo/máximo do R$/m² (faixa) e média (valor de referência)
+        min_c, max_c = df["Preco_m2"].min(), df["Preco_m2"].max()
         media_c = df["Preco_m2"].mean()
         if not terreno_valido.empty:
-            p10_t, p90_t = terreno_valido.quantile([0.10, 0.90])
+            min_t, max_t = terreno_valido.min(), terreno_valido.max()
             media_t = terreno_valido.mean()
         else:
-            p10_t = p90_t = media_t = np.nan
+            min_t = max_t = media_t = np.nan
 
         # cabeçalho do relatório
         contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
@@ -600,13 +600,13 @@ if rua or distrito_alvo != "Selecione...":
         faixas_estimadas = []  # cada item: (rótulo, valor_min, valor_max)
 
         if area_constr_alvo > 0:
-            vmin_c = p10_c * area_constr_alvo
-            vmax_c = p90_c * area_constr_alvo
+            vmin_c = min_c * area_constr_alvo
+            vmax_c = max_c * area_constr_alvo
             faixas_estimadas.append(("Construção", vmin_c, vmax_c))
 
-        if area_terr_alvo > 0 and not np.isnan(p10_t):
-            vmin_t = p10_t * area_terr_alvo
-            vmax_t = p90_t * area_terr_alvo
+        if area_terr_alvo > 0 and not np.isnan(min_t):
+            vmin_t = min_t * area_terr_alvo
+            vmax_t = max_t * area_terr_alvo
             faixas_estimadas.append(("Terreno", vmin_t, vmax_t))
 
         if faixas_estimadas:
@@ -630,8 +630,8 @@ if rua or distrito_alvo != "Selecione...":
                     )
                 if len(faixas_estimadas) == 2:
                     st.markdown("- **Faixa final** = média das faixas de construção e terreno.")
-                st.caption("Limites calculados pelos percentis P10 e P90 do preço/m² dos "
-                           "comparáveis (faixa onde está a maioria dos imóveis, excluindo extremos).")
+                st.caption("Limites calculados pelo menor e maior preço/m² dos comparáveis "
+                           "após o filtro de outliers (se ativado na barra lateral).")
         else:
             st.info("💡 Informe a **área construída** e/ou **área de terreno** na barra lateral "
                     "para obter a faixa de valor estimada do imóvel.")
@@ -645,8 +645,8 @@ if rua or distrito_alvo != "Selecione...":
                   formata_moeda(media_t) if not np.isnan(media_t) else "—")
         j1, j2 = st.columns(2)
         j1.metric("% Modernizados", f'{(df["Status"] == "Modernizado").mean() * 100:.0f}%')
-        j2.metric("Faixa construção P10–P90/m²",
-                  f"{formata_moeda(p10_c)} — {formata_moeda(p90_c)}")
+        j2.metric("Faixa construção (mín–máx)/m²",
+                  f"{formata_moeda(min_c)} — {formata_moeda(max_c)}")
 
         # 9.1 mapa
         df_geo = df.dropna(subset=["Latitude", "Longitude"])
