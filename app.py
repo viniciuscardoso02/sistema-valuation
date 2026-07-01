@@ -182,68 +182,6 @@ def get_coord(df, name, parsed_name):
     return pd.Series(np.nan, index=df.index, dtype="float64")
 
 
-# Parâmetros da inteligência temporal
-TEMPORAL_MIN_TRANSACOES = 30   # mínimo de transações para confiar na curva
-TEMPORAL_MIN_ANOS = 4          # mínimo de anos distintos
-TEMPORAL_N_DESVIOS = 3.0       # filtro de curva: descarta além de ±N desvios
-
-
-def aplica_inteligencia_temporal(df, col_preco, col_ano):
-    """
-    Ajusta uma tendência linear de log(preço/m²) ~ ano e:
-      1) traz cada transação a valor presente (deflaciona pela curva do recorte);
-      2) marca como fora da curva quem está além de ±N desvios do resíduo.
-    Retorna (df_corrigido, info) onde info descreve o que foi feito.
-    Trabalha em log para a tendência ser multiplicativa (% ao ano), o que é o
-    comportamento correto de valorização imobiliária e reduz o viés de patamar.
-    """
-    info = {"aplicado": False, "motivo": "", "ano_ref": None,
-            "valorizacao_aa": None, "removidos": 0}
-
-    base = df.dropna(subset=[col_preco, col_ano]).copy()
-    base = base[base[col_preco] > 0]
-    base["_ano"] = base[col_ano].astype(int)
-
-    n_trans = len(base)
-    n_anos = base["_ano"].nunique()
-    if n_trans < TEMPORAL_MIN_TRANSACOES or n_anos < TEMPORAL_MIN_ANOS:
-        info["motivo"] = (f"amostra insuficiente ({n_trans} transações em {n_anos} "
-                          f"anos; mínimo {TEMPORAL_MIN_TRANSACOES} em {TEMPORAL_MIN_ANOS}).")
-        df = df.copy()
-        df["Preco_m2_Corrigido"] = df[col_preco]
-        df["Fora_da_Curva"] = False
-        return df, info
-
-    # regressão linear de log(preço) ~ ano  (np.polyfit grau 1)
-    x = base["_ano"].to_numpy(dtype=float)
-    y = np.log(base[col_preco].to_numpy(dtype=float))
-    coef = np.polyfit(x, y, 1)            # [inclinação, intercepto]
-    slope, intercept = coef[0], coef[1]
-
-    ano_ref = int(base["_ano"].max())     # traz tudo para o ano mais recente do recorte
-    log_esperado = slope * x + intercept
-    residuos = y - log_esperado
-    sigma = residuos.std(ddof=1) if len(residuos) > 2 else 0.0
-
-    # valorização anual implícita pela curva (e^slope - 1)
-    val_aa = float(np.exp(slope) - 1.0)
-
-    # fator de correção a valor presente: e^(slope * (ano_ref - ano))
-    fator = np.exp(slope * (ano_ref - x))
-    base["_preco_corrigido"] = base[col_preco].to_numpy() * fator
-    base["_fora_curva"] = (np.abs(residuos) > TEMPORAL_N_DESVIOS * sigma) if sigma > 0 else False
-
-    # devolve as colunas calculadas para o df original (via índice)
-    df = df.copy()
-    df["Preco_m2_Corrigido"] = base["_preco_corrigido"].reindex(df.index)
-    df["Preco_m2_Corrigido"] = df["Preco_m2_Corrigido"].fillna(df[col_preco])
-    df["Fora_da_Curva"] = base["_fora_curva"].reindex(df.index).fillna(False)
-
-    info.update({"aplicado": True, "ano_ref": ano_ref, "valorizacao_aa": val_aa,
-                 "removidos": int(base["_fora_curva"].sum())})
-    return df, info
-
-
 # ============================================================================
 # 4. LISTA DE DISTRITOS
 # ============================================================================
@@ -637,66 +575,39 @@ if rua or distrito_alvo != "Selecione...":
             st.warning(f"Nenhuma transação na categoria '{filtro_status}' para este recorte.")
             st.stop()
 
-        # 8.9 INTELIGÊNCIA TEMPORAL: traz preços a valor presente e remove fora-da-curva
-        df, info_temporal = aplica_inteligencia_temporal(df, "Preco_m2", "Ano_Transacao")
-        # mesma correção para o preço de terreno (curva própria), sem remover linhas por ele
-        if df["Preco_m2_Terreno"].notna().sum() >= TEMPORAL_MIN_TRANSACOES:
-            df_t, _ = aplica_inteligencia_temporal(df, "Preco_m2_Terreno", "Ano_Transacao")
-            df["Preco_m2_Terreno_Corrigido"] = df_t["Preco_m2_Corrigido"]
-        else:
-            df["Preco_m2_Terreno_Corrigido"] = df["Preco_m2_Terreno"]
-
-        # remove as transações marcadas como fora da curva (prováveis defeitos)
-        if info_temporal["aplicado"]:
-            df = df[~df["Fora_da_Curva"]]
-        if df.empty:
-            st.warning("Todas as transações ficaram fora da curva neste recorte.")
-            st.stop()
-
         # --------------------------------------------------------------------
         # 9. SAÍDAS — RELATÓRIO DE AVALIAÇÃO
         # --------------------------------------------------------------------
-        # Preço/m² a usar nas estimativas: corrigido a valor presente quando a
-        # inteligência temporal foi aplicada; caso contrário, o nominal.
-        col_preco_ref = "Preco_m2_Corrigido"
-        terreno_valido = df["Preco_m2_Terreno_Corrigido"].dropna()
+        # Preço/m² de terreno só faz sentido onde há área de terreno
+        terreno_valido = df["Preco_m2_Terreno"].dropna()
         terreno_valido = terreno_valido[terreno_valido > 0]
 
-        # Faixa P25–P75 do R$/m² (miolo do mercado) e média (referência)
-        p25_c, p75_c = df[col_preco_ref].quantile([0.25, 0.75])
-        media_c = df[col_preco_ref].mean()
+        # Mínimo/máximo do R$/m² (faixa) e média (valor de referência)
+        min_c, max_c = df["Preco_m2"].min(), df["Preco_m2"].max()
+        media_c = df["Preco_m2"].mean()
         if not terreno_valido.empty:
-            p25_t, p75_t = terreno_valido.quantile([0.25, 0.75])
+            min_t, max_t = terreno_valido.min(), terreno_valido.max()
             media_t = terreno_valido.mean()
         else:
-            p25_t = p75_t = media_t = np.nan
+            min_t = max_t = media_t = np.nan
 
         # cabeçalho do relatório
         contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
         st.markdown("## 📑 Relatório de Avaliação Imobiliária")
         st.markdown(f"**{contexto}**  ·  {len(df):,} transações comparáveis analisadas")
 
-        # aviso sobre a correção temporal (transparência do método)
-        if info_temporal["aplicado"]:
-            st.success(
-                f"🧠 **Preços trazidos a valor de {info_temporal['ano_ref']}** "
-                f"(valorização média do recorte: {info_temporal['valorizacao_aa']*100:+.1f}% a.a.). "
-                f"{info_temporal['removidos']} transação(ões) fora da curva foram descartadas."
-            )
-        else:
-            st.warning(f"⚠️ Correção temporal **não aplicada**: {info_temporal['motivo']} "
-                       f"Os valores abaixo são nominais (sem trazer a valor presente).")
-
         # ---- FAIXA DE VALOR ESTIMADA (só quando a pessoa digitou a área) ----
         faixas_estimadas = []  # cada item: (rótulo, valor_min, valor_max)
 
         if area_constr_alvo > 0:
-            faixas_estimadas.append(("Construção", p25_c * area_constr_alvo,
-                                     p75_c * area_constr_alvo))
+            vmin_c = min_c * area_constr_alvo
+            vmax_c = max_c * area_constr_alvo
+            faixas_estimadas.append(("Construção", vmin_c, vmax_c))
 
-        if area_terr_alvo > 0 and not np.isnan(p25_t):
-            faixas_estimadas.append(("Terreno", p25_t * area_terr_alvo,
-                                     p75_t * area_terr_alvo))
+        if area_terr_alvo > 0 and not np.isnan(min_t):
+            vmin_t = min_t * area_terr_alvo
+            vmax_t = max_t * area_terr_alvo
+            faixas_estimadas.append(("Terreno", vmin_t, vmax_t))
 
         if faixas_estimadas:
             st.markdown("### 💰 Faixa de valor estimada para o imóvel")
@@ -719,9 +630,8 @@ if rua or distrito_alvo != "Selecione...":
                     )
                 if len(faixas_estimadas) == 2:
                     st.markdown("- **Faixa final** = média das faixas de construção e terreno.")
-                st.caption("Limites = percentis P25 e P75 do preço/m² dos comparáveis "
-                           "(miolo do mercado), já a valor presente quando a correção "
-                           "temporal está ativa.")
+                st.caption("Limites calculados pelo menor e maior preço/m² dos comparáveis "
+                           "após o filtro de outliers (se ativado na barra lateral).")
         else:
             st.info("💡 Informe a **área construída** e/ou **área de terreno** na barra lateral "
                     "para obter a faixa de valor estimada do imóvel.")
@@ -735,8 +645,8 @@ if rua or distrito_alvo != "Selecione...":
                   formata_moeda(media_t) if not np.isnan(media_t) else "—")
         j1, j2 = st.columns(2)
         j1.metric("% Modernizados", f'{(df["Status"] == "Modernizado").mean() * 100:.0f}%')
-        j2.metric("Faixa construção P25–P75/m²",
-                  f"{formata_moeda(p25_c)} — {formata_moeda(p75_c)}")
+        j2.metric("Faixa construção (mín–máx)/m²",
+                  f"{formata_moeda(min_c)} — {formata_moeda(max_c)}")
 
         # 9.1 mapa
         df_geo = df.dropna(subset=["Latitude", "Longitude"])
@@ -856,7 +766,7 @@ if rua or distrito_alvo != "Selecione...":
         ag = (
             df.dropna(subset=["Faixa_Area"])
             .groupby(["Faixa_Area", "Status"], observed=True)
-            .agg(preco_m2=("Preco_m2_Corrigido", "mean"), n=("Preco_m2_Corrigido", "size"))
+            .agg(preco_m2=("Preco_m2", "mean"), n=("Preco_m2", "size"))
             .reset_index()
         )
 
@@ -895,7 +805,7 @@ if rua or distrito_alvo != "Selecione...":
                 st.dataframe(tabela, use_container_width=True)
 
         # 9.2b GRÁFICO: evolução do R$/m² médio por ano da transação (Modernizado × Antigo)
-        st.markdown("### 📉 Evolução do R$/m² médio por ano da transação (valores históricos)")
+        st.markdown("### 📉 Evolução do R$/m² médio por ano da transação")
         serie = df.dropna(subset=["Ano_Transacao", "Preco_m2"]).copy()
         serie["Ano"] = serie["Ano_Transacao"].astype(int)
         evol = (
