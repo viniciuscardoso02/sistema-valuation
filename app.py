@@ -372,6 +372,89 @@ def bbox_de_feature(feature):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+# --- Pontos de interesse (POIs) via OpenStreetMap / Overpass API ---
+# Cada categoria define: rótulo, cor, ícone (folium/glyphicon) e os filtros OSM.
+POI_CATEGORIAS = {
+    "educacao": {
+        "label": "Educação", "cor": "blue", "icone": "education",
+        "filtros": ['["amenity"~"school|university|college"]'],
+    },
+    "verde": {
+        "label": "Áreas verdes", "cor": "green", "icone": "tree-conifer",
+        "filtros": ['["leisure"="park"]', '["leisure"="garden"]'],
+    },
+    "saude": {
+        "label": "Saúde", "cor": "red", "icone": "plus-sign",
+        "filtros": ['["amenity"~"hospital|clinic|doctors"]'],
+    },
+    "comercio": {
+        "label": "Comércio/serviços", "cor": "orange", "icone": "shopping-cart",
+        "filtros": ['["shop"="mall"]', '["shop"="supermarket"]',
+                    '["amenity"="marketplace"]'],
+    },
+    "cultura": {
+        "label": "Cultura/lazer", "cor": "purple", "icone": "star",
+        "filtros": ['["tourism"~"museum|gallery"]',
+                    '["amenity"~"theatre|cinema|arts_centre"]'],
+    },
+}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def buscar_pois_bbox(min_lon, min_lat, max_lon, max_lat, categorias_key):
+    """Consulta a Overpass API pelos POIs das categorias dentro do bbox.
+    Retorna dict {categoria: [ (lat, lon, nome), ... ]}. Cacheado por 1h.
+    categorias_key é uma tupla ordenada (para o cache do Streamlit funcionar)."""
+    import requests
+    resultados = {c: [] for c in categorias_key}
+    # bbox no Overpass: (sul, oeste, norte, leste) = (min_lat,min_lon,max_lat,max_lon)
+    bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+    partes = []
+    for cat in categorias_key:
+        for filtro in POI_CATEGORIAS[cat]["filtros"]:
+            # node e way (centro), para pegar tanto pontos quanto polígonos
+            partes.append(f'node{filtro}({bbox});')
+            partes.append(f'way{filtro}({bbox});')
+    query = f"[out:json][timeout:25];({''.join(partes)});out center tags;"
+
+    try:
+        r = requests.post("https://overpass-api.de/api/interpreter",
+                          data={"data": query}, timeout=40)
+        elementos = r.json().get("elements", [])
+    except Exception:
+        return None  # falha de rede/serviço -> o app trata como indisponível
+
+    for el in elementos:
+        tags = el.get("tags", {})
+        nome = tags.get("name", "(sem nome)")
+        if el["type"] == "node":
+            lat, lon = el.get("lat"), el.get("lon")
+        else:  # way -> usa o centro
+            c = el.get("center", {})
+            lat, lon = c.get("lat"), c.get("lon")
+        if lat is None or lon is None:
+            continue
+        # descobre a que categoria pertence (pela 1ª que casar com as tags)
+        for cat in categorias_key:
+            achou = False
+            if cat == "educacao" and tags.get("amenity") in ("school", "university", "college"):
+                achou = True
+            elif cat == "verde" and tags.get("leisure") in ("park", "garden"):
+                achou = True
+            elif cat == "saude" and tags.get("amenity") in ("hospital", "clinic", "doctors"):
+                achou = True
+            elif cat == "comercio" and (tags.get("shop") in ("mall", "supermarket")
+                                        or tags.get("amenity") == "marketplace"):
+                achou = True
+            elif cat == "cultura" and (tags.get("tourism") in ("museum", "gallery")
+                                       or tags.get("amenity") in ("theatre", "cinema", "arts_centre")):
+                achou = True
+            if achou:
+                resultados[cat].append((lat, lon, nome))
+                break
+    return resultados
+
+
 def centroide_distrito(feature):
     """Centro aproximado de um polígono (média dos vértices), sem depender de libs geo."""
     try:
@@ -455,6 +538,17 @@ mostrar_zoneamento = st.sidebar.toggle(
     help=("Desenha as zonas de uso do solo (ZER, ZM, ZEIS, ZEU...) sobre o mapa "
           "do distrito. As zonas são buscadas na hora do GeoSampa, só para a "
           "área visível."),
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("📍 Pontos de Interesse")
+pois_selecionados = st.sidebar.multiselect(
+    "Mostrar no mapa (OpenStreetMap)",
+    options=list(POI_CATEGORIAS.keys()),
+    format_func=lambda k: POI_CATEGORIAS[k]["label"],
+    default=[],
+    help=("Escolas, parques, saúde, comércio e cultura da região. "
+          "Buscados na hora do OpenStreetMap, só para a área visível."),
 )
 
 
@@ -995,7 +1089,48 @@ if rua or distrito_alvo != "Selecione...":
                                    "de terreno fracionada e podem distorcer — filtre por "
                                    "'Residenciais' para uma leitura mais limpa.")
 
+            # --- Pontos de interesse (OpenStreetMap), opcional ---
+            contagem_pois = {}
+            if pois_selecionados:
+                # bbox: no modo distrito usa o polígono; no raio, o alvo ± raio;
+                # senão, a extensão dos comparáveis.
+                poi_bb = None
+                if feature_dist is not None:
+                    poi_bb = bbox_de_feature(feature_dist)
+                elif lat_c and lon_c:
+                    d = raio / 111000.0  # ~graus por metro
+                    poi_bb = (lon_c - d, lat_c - d, lon_c + d, lat_c + d)
+                elif not df_geo.empty:
+                    poi_bb = (df_geo["Longitude"].min(), df_geo["Latitude"].min(),
+                              df_geo["Longitude"].max(), df_geo["Latitude"].max())
+
+                if poi_bb is not None:
+                    with st.spinner("Buscando pontos de interesse (OpenStreetMap)..."):
+                        pois = buscar_pois_bbox(*poi_bb, tuple(sorted(pois_selecionados)))
+                    if pois:
+                        grupo_poi = folium.FeatureGroup(name="Pontos de interesse")
+                        for cat, lista in pois.items():
+                            meta = POI_CATEGORIAS[cat]
+                            contagem_pois[cat] = len(lista)
+                            for lat, lon, nome in lista:
+                                folium.Marker(
+                                    [lat, lon],
+                                    tooltip=f"{meta['label']}: {nome}",
+                                    icon=folium.Icon(color=meta["cor"], icon=meta["icone"]),
+                                ).add_to(grupo_poi)
+                        grupo_poi.add_to(m)
+                    else:
+                        st.caption("ℹ️ Pontos de interesse indisponíveis no momento "
+                                   "(OpenStreetMap não respondeu). Tente novamente em instantes.")
+
             render_map(m)
+
+            # contagem de POIs abaixo do mapa (indicador da região)
+            if contagem_pois:
+                st.markdown("#### 📍 Infraestrutura da região")
+                cols_poi = st.columns(len(contagem_pois))
+                for col, (cat, qtd) in zip(cols_poi, contagem_pois.items()):
+                    col.metric(POI_CATEGORIAS[cat]["label"], qtd)
         else:
             st.info("ℹ️ Sem coordenadas válidas nesta amostra (modo textual) — mapa "
                     "indisponível, mas o histórico abaixo é válido.")
