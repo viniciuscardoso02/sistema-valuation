@@ -229,6 +229,66 @@ def carregar_geojson_distritos(caminho):
 DISTRITOS_GEO, _ = carregar_geojson_distritos(GEOJSON_DISTRITOS)
 
 
+# --- Zoneamento (LPUOS 2016) buscado sob demanda por área, direto do GeoSampa ---
+WFS_GEOSAMPA = "http://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
+CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
+CAMPO_ZONA = "cd_zoneamento_perimetro"
+
+
+def _cor_zona(sigla):
+    """Cor estável por família de zona (ZER, ZM, ZEIS, ZEU, ZC, ZPI...)."""
+    s = (sigla or "").upper()
+    if s.startswith("ZEIS"):
+        return "#e6550d"   # habitação de interesse social
+    if s.startswith("ZER"):
+        return "#31a354"   # exclusivamente residencial
+    if s.startswith("ZEU") or s.startswith("ZEM"):
+        return "#756bb1"   # eixos de estruturação (adensamento)
+    if s.startswith("ZC"):
+        return "#3182bd"   # centralidades
+    if s.startswith("ZM"):
+        return "#f2c744"   # mista
+    if s.startswith("ZPI") or s.startswith("ZDE"):
+        return "#969696"   # predominantemente industrial / desenvolvimento
+    if "PRAÇA" in s or "CANTEIRO" in s or s.startswith("ZEP"):
+        return "#a1d99b"   # verde / praças / proteção ambiental
+    return "#bdbdbd"       # demais
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def buscar_zoneamento_bbox(min_lon, min_lat, max_lon, max_lat):
+    """Baixa do WFS apenas os polígonos de zona que intersectam o bbox informado.
+    Retorna um GeoJSON (dict) ou None. Cacheado por 1h para não repetir chamadas."""
+    import requests
+    # BBOX no WFS 2.0.0 com EPSG:4326 usa ordem lat,lon (min,max)
+    bbox = f"{min_lat},{min_lon},{max_lat},{max_lon},urn:ogc:def:crs:EPSG::4326"
+    try:
+        r = requests.get(WFS_GEOSAMPA, params={
+            "service": "WFS", "version": "2.0.0", "request": "GetFeature",
+            "typeNames": CAMADA_ZONEAMENTO, "outputFormat": "application/json",
+            "srsName": "EPSG:4326", "bbox": bbox, "count": 4000,
+        }, timeout=60)
+        return r.json()
+    except Exception:
+        return None
+
+
+def bbox_de_feature(feature):
+    """Retorna (min_lon, min_lat, max_lon, max_lat) de um polígono/multipolígono."""
+    xs, ys = [], []
+    geom = feature["geometry"]
+    def _walk(coords):
+        for c in coords:
+            if isinstance(c[0], (int, float)):
+                xs.append(c[0]); ys.append(c[1])
+            else:
+                _walk(c)
+    _walk(geom["coordinates"])
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def centroide_distrito(feature):
     """Centro aproximado de um polígono (média dos vértices), sem depender de libs geo."""
     try:
@@ -303,6 +363,15 @@ heatmap_modo = st.sidebar.radio(
     ["Desligado", "Densidade de transações", "Preço/m² de terreno"],
     help=("Densidade: regiões com mais transações ficam quentes. "
           "Preço/m² de terreno: regiões mais caras ficam quentes (ponderado pelo valor)."),
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🗺️ Zoneamento")
+mostrar_zoneamento = st.sidebar.toggle(
+    "Mostrar zoneamento (LPUOS 2016)", value=False,
+    help=("Desenha as zonas de uso do solo (ZER, ZM, ZEIS, ZEU...) sobre o mapa "
+          "do distrito. As zonas são buscadas na hora do GeoSampa, só para a "
+          "área visível."),
 )
 
 
@@ -696,6 +765,46 @@ if rua or distrito_alvo != "Selecione...":
                     m.fit_bounds(folium.GeoJson(feature_dist).get_bounds())
                 except Exception:
                     pass
+
+            # camada de ZONEAMENTO (opcional, só no modo distrito) — buscada por bbox
+            if mostrar_zoneamento and feature_dist is not None:
+                bb = bbox_de_feature(feature_dist)
+                if bb is not None:
+                    with st.spinner("Carregando zoneamento do distrito..."):
+                        zjson = buscar_zoneamento_bbox(*bb)
+                    feats_z = (zjson or {}).get("features", [])
+                    if feats_z:
+                        siglas_presentes = {}
+                        for fz in feats_z:
+                            sig = str(fz.get("properties", {}).get(CAMPO_ZONA, "—"))
+                            cor = _cor_zona(sig)
+                            siglas_presentes[sig] = cor
+                            folium.GeoJson(
+                                fz,
+                                style_function=lambda _f, _c=cor: {
+                                    "color": _c, "weight": 1,
+                                    "fill": True, "fillColor": _c, "fillOpacity": 0.25,
+                                },
+                                tooltip=sig,
+                            ).add_to(m)
+                        # legenda das zonas presentes
+                        itens = "".join(
+                            f'<div style="margin:2px 0"><span style="display:inline-block;'
+                            f'width:12px;height:12px;background:{c};margin-right:6px;'
+                            f'border:1px solid #666"></span>{s}</div>'
+                            for s, c in sorted(siglas_presentes.items())
+                        )
+                        legenda = (
+                            '<div style="position:fixed;bottom:30px;right:12px;z-index:9999;'
+                            'background:white;padding:8px 10px;border:1px solid #999;'
+                            'border-radius:6px;font-size:11px;max-height:240px;'
+                            'overflow:auto;box-shadow:0 1px 4px rgba(0,0,0,.3)">'
+                            '<b>Zoneamento (LPUOS 2016)</b>' + itens + '</div>'
+                        )
+                        m.get_root().html.add_child(folium.Element(legenda))
+                    else:
+                        st.info("ℹ️ Zoneamento indisponível para esta área no momento "
+                                "(serviço do GeoSampa não respondeu ou não há zonas no recorte).")
 
             cores = {"Modernizado": "green", "Antigo": "blue"}
             camada = MarkerCluster().add_to(m) if HAS_CLUSTER else m
