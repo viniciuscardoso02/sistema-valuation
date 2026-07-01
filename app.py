@@ -372,6 +372,47 @@ def bbox_de_feature(feature):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+# --- Grade de valorização (% a.a. por célula) ---
+VALOR_CELULA_GRAUS = 0.003     # ~330 m (lado da célula da grade)
+VALOR_MIN_TRANSACOES = 8       # mínimo de transações na célula
+VALOR_MIN_ANOS = 3             # mínimo de anos distintos na célula
+
+
+def grade_valorizacao(df_pts):
+    """Divide os pontos numa grade e calcula a valorização anual (% a.a.) por
+    célula via regressão log(preço/m²) ~ ano. Retorna lista de células:
+    (lat_centro, lon_centro, valorizacao_aa, n). Só inclui células com dados
+    suficientes (nº de transações e anos distintos), para evitar ruído."""
+    d = df_pts.dropna(subset=["Latitude", "Longitude", "Preco_m2", "Ano_Transacao"]).copy()
+    d = d[d["Preco_m2"] > 0]
+    if d.empty:
+        return []
+
+    passo = VALOR_CELULA_GRAUS
+    # índice da célula na grade (arredonda coordenada para o canto da célula)
+    d["_gx"] = np.floor(d["Longitude"] / passo).astype(int)
+    d["_gy"] = np.floor(d["Latitude"] / passo).astype(int)
+    d["_ano"] = d["Ano_Transacao"].astype(int)
+
+    celulas = []
+    for (gx, gy), grupo in d.groupby(["_gx", "_gy"]):
+        if len(grupo) < VALOR_MIN_TRANSACOES:
+            continue
+        if grupo["_ano"].nunique() < VALOR_MIN_ANOS:
+            continue
+        x = grupo["_ano"].to_numpy(dtype=float)
+        y = np.log(grupo["Preco_m2"].to_numpy(dtype=float))
+        try:
+            slope = np.polyfit(x, y, 1)[0]
+        except Exception:
+            continue
+        val_aa = float(np.exp(slope) - 1.0)   # valorização anual composta
+        lat_centro = (gy + 0.5) * passo
+        lon_centro = (gx + 0.5) * passo
+        celulas.append((lat_centro, lon_centro, val_aa, len(grupo)))
+    return celulas
+
+
 # --- Pontos de interesse (POIs) via OpenStreetMap / Overpass API ---
 # Cada categoria define: rótulo, cor, ícone (folium/glyphicon) e os filtros OSM.
 POI_CATEGORIAS = {
@@ -544,9 +585,12 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔥 Mapa de Calor")
 heatmap_modo = st.sidebar.radio(
     "Camada de calor no mapa",
-    ["Desligado", "Densidade de transações", "Preço/m² de terreno"],
+    ["Desligado", "Densidade de transações", "Preço/m² de terreno",
+     "Valorização (% a.a.)"],
     help=("Densidade: regiões com mais transações ficam quentes. "
-          "Preço/m² de terreno: regiões mais caras ficam quentes (ponderado pelo valor)."),
+          "Preço/m² de terreno: regiões mais caras ficam quentes. "
+          "Valorização: regiões que mais subiram de preço ao ano ficam quentes "
+          "(grade por célula, via tendência histórica)."),
 )
 
 st.sidebar.markdown("---")
@@ -1086,8 +1130,8 @@ if rua or distrito_alvo != "Selecione...":
                     if pontos:
                         HeatMap(pontos, radius=18, blur=22, min_opacity=0.3,
                                 name="Densidade").add_to(m)
-                else:
-                    # Preço/m² de terreno -> ponderado pelo valor (regiões caras ficam quentes)
+                elif heatmap_modo == "Preço/m² de terreno":
+                    # ponderado pelo valor (regiões caras ficam quentes)
                     h = df_geo.dropna(subset=["Preco_m2_Terreno"]).copy()
                     h = h[h["Preco_m2_Terreno"] > 0]
                     if not h.empty:
@@ -1106,6 +1150,52 @@ if rua or distrito_alvo != "Selecione...":
                                    "indicam terreno mais caro na região. Apartamentos têm área "
                                    "de terreno fracionada e podem distorcer — filtre por "
                                    "'Residenciais' para uma leitura mais limpa.")
+                elif heatmap_modo == "Valorização (% a.a.)":
+                    # grade de células coloridas pela valorização anual (regressão por célula)
+                    celulas = grade_valorizacao(df_geo)
+                    if not celulas:
+                        st.caption("ℹ️ Sem células com dados suficientes para calcular "
+                                   "valorização neste recorte (é preciso ao menos "
+                                   f"{VALOR_MIN_TRANSACOES} transações em "
+                                   f"{VALOR_MIN_ANOS} anos por célula).")
+                    else:
+                        vals = np.array([c[2] for c in celulas])
+                        # escala de cor simétrica em torno de 0, cortando extremos (p10–p90)
+                        lim = max(abs(np.quantile(vals, 0.10)), abs(np.quantile(vals, 0.90)))
+                        lim = lim if lim > 0 else (abs(vals).max() or 0.01)
+
+                        def _cor_val(v):
+                            # vermelho (desvaloriza) -> cinza (estável) -> verde (valoriza)
+                            t = max(-1.0, min(1.0, v / lim))
+                            if t >= 0:
+                                # cinza -> verde
+                                r = int(158 + (26 - 158) * t)
+                                g = int(158 + (152 - 158) * t)
+                                b = int(158 + (80 - 158) * t)
+                            else:
+                                # cinza -> vermelho
+                                r = int(158 + (215 - 158) * (-t))
+                                g = int(158 + (48 - 158) * (-t))
+                                b = int(158 + (39 - 158) * (-t))
+                            return f"#{r:02x}{g:02x}{b:02x}"
+
+                        passo = VALOR_CELULA_GRAUS
+                        for lat_c2, lon_c2, val_aa, n in celulas:
+                            cor = _cor_val(val_aa)
+                            bounds = [[lat_c2 - passo / 2, lon_c2 - passo / 2],
+                                      [lat_c2 + passo / 2, lon_c2 + passo / 2]]
+                            folium.Rectangle(
+                                bounds, color=cor, weight=0.5, fill=True,
+                                fill_color=cor, fill_opacity=0.55,
+                                popup=folium.Popup(
+                                    f"<b>Valorização:</b> {val_aa*100:+.1f}% a.a.<br>"
+                                    f"<b>Transações:</b> {n}", max_width=200),
+                            ).add_to(m)
+
+                        med = np.median(vals) * 100
+                        st.caption(f"🔥 **Valorização por célula (~330 m)**: verde = subindo, "
+                                   f"vermelho = caindo, cinza = estável. Mediana das células: "
+                                   f"{med:+.1f}% a.a. Células com poucos dados foram ocultadas.")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
