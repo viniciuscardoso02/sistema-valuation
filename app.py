@@ -235,6 +235,61 @@ CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
 CAMPO_ZONA = "cd_zoneamento_perimetro"
 
 
+# --- Parâmetros construtivos do Quadro 3 da LPUOS (Lei 16.402/2016) ---
+# Fonte oficial: gestaourbana.prefeitura.sp.gov.br (Quadro 3 - Parâmetros de ocupação).
+# Campos: CA básico, CA máximo, TO (<500m²), TO (>=500m²), gabarito (m).
+# "NA (livre)" = gabarito não definido pela zona. obs = nota do próprio Quadro 3.
+QUADRO3_PARAMETROS = {
+    "ZEU":    {"ca_bas": "1", "ca_max": "4",   "to_ate500": "0,85", "to_500": "0,70", "gab": "NA (livre)", "obs": ""},
+    "ZEUa":   {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,70", "to_500": "0,50", "gab": "28", "obs": ""},
+    "ZEUP":   {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "28", "obs": "Atendido o art. 83 do PDE, recebe os parâmetros de ZEU (CAmáx 4)."},
+    "ZEUPa":  {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,70", "to_500": "0,50", "gab": "28", "obs": "Atendido o art. 83 do PDE, recebe os parâmetros de ZEUa."},
+    "ZEM":    {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "28", "obs": "CAmáx pode ser 4 nos casos do §1º do art. 8º."},
+    "ZEMP":   {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "28", "obs": "CAmáx pode ser 4 nos casos do §2º do art. 8º."},
+    "ZC":     {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "48", "obs": ""},
+    "ZCa":    {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,70", "to_500": "0,70", "gab": "20", "obs": ""},
+    "ZC-ZEIS":{"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "NA (livre)", "obs": ""},
+    "ZCOR-1": {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZCOR-2": {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZCOR-3": {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZCORa":  {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZM":     {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "28", "obs": ""},
+    "ZMa":    {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,70", "to_500": "0,50", "gab": "15", "obs": ""},
+    "ZMIS":   {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,85", "to_500": "0,70", "gab": "28", "obs": ""},
+    "ZMISa":  {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,70", "to_500": "0,50", "gab": "15", "obs": ""},
+    "ZEIS-1": {"ca_bas": "1", "ca_max": "2,5", "to_ate500": "0,85", "to_500": "0,70", "gab": "NA (livre)", "obs": "CAmáx = 2 se o lote < 1.000 m²."},
+    "ZEIS-2": {"ca_bas": "1", "ca_max": "4",   "to_ate500": "0,85", "to_500": "0,70", "gab": "NA (livre)", "obs": "CAmáx = 2 se o lote < 1.000 m²."},
+    "ZEIS-3": {"ca_bas": "1", "ca_max": "4",   "to_ate500": "0,85", "to_500": "0,70", "gab": "NA (livre)", "obs": "CAmáx = 2 se o lote < 500 m²."},
+    "ZEIS-4": {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,70", "to_500": "0,50", "gab": "NA (livre)", "obs": "CAmáx = 1 se o lote < 1.000 m²."},
+    "ZEIS-5": {"ca_bas": "1", "ca_max": "4",   "to_ate500": "0,85", "to_500": "0,70", "gab": "NA (livre)", "obs": "CAmáx = 2 se o lote < 1.000 m²."},
+    "ZDE-1":  {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,70", "to_500": "0,70", "gab": "28", "obs": ""},
+    "ZDE-2":  {"ca_bas": "1", "ca_max": "2",   "to_ate500": "0,70", "to_500": "0,50", "gab": "28", "obs": ""},
+    "ZPI-1":  {"ca_bas": "1", "ca_max": "1,5", "to_ate500": "0,70", "to_500": "0,70", "gab": "28", "obs": ""},
+    "ZPI-2":  {"ca_bas": "1", "ca_max": "1,5", "to_ate500": "0,50", "to_500": "0,30", "gab": "28", "obs": ""},
+    "ZPR":    {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZER-1":  {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZER-2":  {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZERa":   {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,50", "to_500": "0,50", "gab": "10", "obs": ""},
+    "ZPDS":   {"ca_bas": "1", "ca_max": "1",   "to_ate500": "0,35", "to_500": "0,25", "gab": "20", "obs": ""},
+    "ZPDSr":  {"ca_bas": "0,2", "ca_max": "0,2","to_ate500": "0,20", "to_500": "0,15", "gab": "10", "obs": ""},
+    "ZEPAM":  {"ca_bas": "0,1", "ca_max": "0,1","to_ate500": "0,10", "to_500": "0,10", "gab": "10", "obs": ""},
+}
+
+
+def parametros_construtivos(sigla):
+    """Parâmetros do Quadro 3 para a sigla. Correspondência exata e, se falhar,
+    por prefixo mais longo (ZCOR-1 antes de ZC)."""
+    if not sigla:
+        return None
+    s = str(sigla).upper().strip()
+    if s in QUADRO3_PARAMETROS:
+        return QUADRO3_PARAMETROS[s]
+    for chave in sorted(QUADRO3_PARAMETROS, key=len, reverse=True):
+        if s.startswith(chave):
+            return QUADRO3_PARAMETROS[chave]
+    return None
+
+
 def nome_familia_zona(sigla):
     """Nome legível da família da zona a partir da sigla (LPUOS 2016)."""
     s = (sigla or "").upper()
@@ -823,6 +878,29 @@ if rua or distrito_alvo != "Selecione...":
                                 linhas.append(f"<b>Descrição:</b> {descr}")
                             if obs and str(obs).strip() and str(obs).lower() != "none":
                                 linhas.append(f"<b>Obs.:</b> {obs}")
+
+                            # parâmetros construtivos do Quadro 3 (LPUOS 2016)
+                            par = parametros_construtivos(sig)
+                            if par:
+                                linhas.append(
+                                    "<hr style='margin:5px 0'>"
+                                    "<b>Parâmetros construtivos (Quadro 3)</b>"
+                                    f"<br>• Coef. aproveitamento: básico <b>{par['ca_bas']}</b>"
+                                    f" · máximo <b>{par['ca_max']}</b>"
+                                    f"<br>• Taxa de ocupação: {par['to_ate500']} (lote &lt;500m²)"
+                                    f" · {par['to_500']} (≥500m²)"
+                                    f"<br>• Gabarito de altura: <b>{par['gab']}</b> m"
+                                )
+                                if par.get("obs"):
+                                    linhas.append(
+                                        f"<span style='color:#777;font-size:10px'>{par['obs']}</span>"
+                                    )
+                                linhas.append(
+                                    "<span style='color:#999;font-size:10px'>"
+                                    "Fonte: Quadro 3 da Lei 16.402/2016 (LPUOS). "
+                                    "Confirme exceções na lei.</span>"
+                                )
+
                             if lei:
                                 leg = f"Lei {lei}"
                                 if ano_lei:
