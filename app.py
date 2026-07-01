@@ -403,38 +403,56 @@ POI_CATEGORIAS = {
 @st.cache_data(show_spinner=False, ttl=3600)
 def buscar_pois_bbox(min_lon, min_lat, max_lon, max_lat, categorias_key):
     """Consulta a Overpass API pelos POIs das categorias dentro do bbox.
-    Retorna dict {categoria: [ (lat, lon, nome), ... ]}. Cacheado por 1h.
-    categorias_key é uma tupla ordenada (para o cache do Streamlit funcionar)."""
+    Retorna dict {categoria: [ (lat, lon, nome), ... ]} em caso de sucesso,
+    ou {"_erro": "mensagem"} em caso de falha (para diagnóstico na tela).
+    Tenta múltiplos servidores espelho, pois o endpoint público vive instável."""
     import requests
     resultados = {c: [] for c in categorias_key}
-    # bbox no Overpass: (sul, oeste, norte, leste) = (min_lat,min_lon,max_lat,max_lon)
     bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
     partes = []
     for cat in categorias_key:
         for filtro in POI_CATEGORIAS[cat]["filtros"]:
-            # node e way (centro), para pegar tanto pontos quanto polígonos
             partes.append(f'node{filtro}({bbox});')
             partes.append(f'way{filtro}({bbox});')
-    query = f"[out:json][timeout:25];({''.join(partes)});out center tags;"
+    query = f"[out:json][timeout:60];({''.join(partes)});out center tags;"
 
-    try:
-        r = requests.post("https://overpass-api.de/api/interpreter",
-                          data={"data": query}, timeout=40)
-        elementos = r.json().get("elements", [])
-    except Exception:
-        return None  # falha de rede/serviço -> o app trata como indisponível
+    # servidores espelho da Overpass — se um falha, tenta o próximo
+    espelhos = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    ]
+    elementos = None
+    ultimo_erro = ""
+    for url in espelhos:
+        try:
+            r = requests.post(url, data={"data": query},
+                              headers={"User-Agent": "h2i-valuation/1.0"}, timeout=90)
+            if r.status_code != 200:
+                ultimo_erro = f"HTTP {r.status_code} em {url.split('/')[2]}"
+                continue
+            elementos = r.json().get("elements", [])
+            break  # sucesso
+        except requests.exceptions.Timeout:
+            ultimo_erro = f"timeout em {url.split('/')[2]}"
+        except ValueError:
+            ultimo_erro = f"resposta não-JSON de {url.split('/')[2]} (servidor sobrecarregado)"
+        except Exception as e:
+            ultimo_erro = f"{type(e).__name__} em {url.split('/')[2]}"
+
+    if elementos is None:
+        return {"_erro": ultimo_erro or "todos os servidores falharam"}
 
     for el in elementos:
         tags = el.get("tags", {})
         nome = tags.get("name", "(sem nome)")
         if el["type"] == "node":
             lat, lon = el.get("lat"), el.get("lon")
-        else:  # way -> usa o centro
+        else:
             c = el.get("center", {})
             lat, lon = c.get("lat"), c.get("lon")
         if lat is None or lon is None:
             continue
-        # descobre a que categoria pertence (pela 1ª que casar com as tags)
         for cat in categorias_key:
             achou = False
             if cat == "educacao" and tags.get("amenity") in ("school", "university", "college"):
@@ -1107,11 +1125,13 @@ if rua or distrito_alvo != "Selecione...":
                 if poi_bb is not None:
                     with st.spinner("Buscando pontos de interesse (OpenStreetMap)..."):
                         pois = buscar_pois_bbox(*poi_bb, tuple(sorted(pois_selecionados)))
-                    if pois:
+                    if pois and "_erro" not in pois:
                         grupo_poi = folium.FeatureGroup(name="Pontos de interesse")
+                        total_pois = 0
                         for cat, lista in pois.items():
                             meta = POI_CATEGORIAS[cat]
                             contagem_pois[cat] = len(lista)
+                            total_pois += len(lista)
                             for lat, lon, nome in lista:
                                 folium.Marker(
                                     [lat, lon],
@@ -1119,9 +1139,14 @@ if rua or distrito_alvo != "Selecione...":
                                     icon=folium.Icon(color=meta["cor"], icon=meta["icone"]),
                                 ).add_to(grupo_poi)
                         grupo_poi.add_to(m)
+                        if total_pois == 0:
+                            st.caption("ℹ️ Nenhum ponto de interesse encontrado nesta área "
+                                       "para as categorias selecionadas.")
                     else:
-                        st.caption("ℹ️ Pontos de interesse indisponíveis no momento "
-                                   "(OpenStreetMap não respondeu). Tente novamente em instantes.")
+                        motivo = pois.get("_erro", "sem resposta") if pois else "sem resposta"
+                        st.caption(f"ℹ️ Pontos de interesse indisponíveis no momento "
+                                   f"({motivo}). O serviço público do OpenStreetMap costuma "
+                                   f"oscilar — tente novamente em alguns segundos.")
 
             render_map(m)
 
