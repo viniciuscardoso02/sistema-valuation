@@ -235,6 +235,34 @@ CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
 CAMPO_ZONA = "cd_zoneamento_perimetro"
 
 
+def nome_familia_zona(sigla):
+    """Nome legível da família da zona a partir da sigla (LPUOS 2016)."""
+    s = (sigla or "").upper()
+    familias = [
+        ("ZEIS", "Zona Especial de Interesse Social"),
+        ("ZEPAM", "Zona Especial de Proteção Ambiental"),
+        ("ZEPEC", "Zona Especial de Preservação Cultural"),
+        ("ZEP", "Zona Especial de Preservação"),
+        ("ZER", "Zona Exclusivamente Residencial"),
+        ("ZEUP", "Eixo de Estruturação (Previsto)"),
+        ("ZEU", "Eixo de Estruturação da Transformação Urbana"),
+        ("ZEM", "Eixo de Estruturação (Metropolitano)"),
+        ("ZC", "Zona de Centralidade"),
+        ("ZM", "Zona Mista"),
+        ("ZPI", "Zona Predominantemente Industrial"),
+        ("ZDE", "Zona de Desenvolvimento Econômico"),
+        ("ZPR", "Zona Predominantemente Residencial"),
+        ("ZOE", "Zona de Ocupação Especial"),
+        ("ZLT", "Zona de Lazer e Turismo"),
+    ]
+    for pref, nome in familias:
+        if s.startswith(pref):
+            return nome
+    if "PRAÇA" in s or "CANTEIRO" in s:
+        return "Praça / Canteiro / Área verde"
+    return ""
+
+
 def _cor_zona(sigla):
     """Cor estável por família de zona (ZER, ZM, ZEIS, ZEU, ZC, ZPI...)."""
     s = (sigla or "").upper()
@@ -776,16 +804,43 @@ if rua or distrito_alvo != "Selecione...":
                     if feats_z:
                         siglas_presentes = {}
                         for fz in feats_z:
-                            sig = str(fz.get("properties", {}).get(CAMPO_ZONA, "—"))
+                            props_z = fz.get("properties", {})
+                            sig = str(props_z.get(CAMPO_ZONA, "—"))
                             cor = _cor_zona(sig)
                             siglas_presentes[sig] = cor
+
+                            # monta o popup com as informações disponíveis da zona
+                            descr = props_z.get("tx_zoneamento_perimetro")
+                            obs = props_z.get("tx_observacao_perimetro")
+                            lei = props_z.get("cd_numero_legislacao_zoneamento")
+                            ano_lei = props_z.get("an_legislacao_zoneamento")
+                            nome_zona = nome_familia_zona(sig)
+
+                            linhas = [f"<b style='font-size:13px'>{sig}</b>"]
+                            if nome_zona:
+                                linhas.append(f"<span style='color:#555'>{nome_zona}</span>")
+                            if descr and str(descr).strip() and str(descr) != sig:
+                                linhas.append(f"<b>Descrição:</b> {descr}")
+                            if obs and str(obs).strip() and str(obs).lower() != "none":
+                                linhas.append(f"<b>Obs.:</b> {obs}")
+                            if lei:
+                                leg = f"Lei {lei}"
+                                if ano_lei:
+                                    leg += f"/{ano_lei}"
+                                linhas.append(f"<span style='color:#777;font-size:11px'>{leg}</span>")
+                            popup_z = "<br>".join(linhas)
+
                             folium.GeoJson(
                                 fz,
                                 style_function=lambda _f, _c=cor: {
                                     "color": _c, "weight": 1,
                                     "fill": True, "fillColor": _c, "fillOpacity": 0.25,
                                 },
+                                highlight_function=lambda _f: {
+                                    "weight": 3, "fillOpacity": 0.45, "color": "#111",
+                                },
                                 tooltip=sig,
+                                popup=folium.Popup(popup_z, max_width=280),
                             ).add_to(m)
                         # legenda das zonas presentes
                         itens = "".join(
@@ -799,7 +854,9 @@ if rua or distrito_alvo != "Selecione...":
                             'background:white;padding:8px 10px;border:1px solid #999;'
                             'border-radius:6px;font-size:11px;max-height:240px;'
                             'overflow:auto;box-shadow:0 1px 4px rgba(0,0,0,.3)">'
-                            '<b>Zoneamento (LPUOS 2016)</b>' + itens + '</div>'
+                            '<b>Zoneamento (LPUOS 2016)</b>'
+                            '<div style="color:#777;margin:2px 0 4px">clique numa zona p/ detalhes</div>'
+                            + itens + '</div>'
                         )
                         m.get_root().html.add_child(folium.Element(legenda))
                     else:
