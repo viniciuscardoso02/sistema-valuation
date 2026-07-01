@@ -373,8 +373,8 @@ def bbox_de_feature(feature):
 
 
 # --- Grade de valorização (% a.a. por célula) ---
-VALOR_CELULA_GRAUS = 0.003     # ~330 m (lado da célula da grade)
-VALOR_MIN_TRANSACOES = 8       # mínimo de transações na célula
+VALOR_CELULA_GRAUS = 0.00135   # ~150 m (lado da célula da grade)
+VALOR_MIN_TRANSACOES = 5       # mínimo de transações na célula
 VALOR_MIN_ANOS = 3             # mínimo de anos distintos na célula
 
 
@@ -1193,7 +1193,7 @@ if rua or distrito_alvo != "Selecione...":
                             ).add_to(m)
 
                         med = np.median(vals) * 100
-                        st.caption(f"🔥 **Valorização por célula (~330 m)**: verde = subindo, "
+                        st.caption(f"🔥 **Valorização por célula (~150 m)**: verde = subindo, "
                                    f"vermelho = caindo, cinza = estável. Mediana das células: "
                                    f"{med:+.1f}% a.a. Células com poucos dados foram ocultadas.")
 
