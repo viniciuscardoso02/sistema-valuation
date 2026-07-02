@@ -452,6 +452,108 @@ def modernizacao_por_quadra(df_pts):
     return resultado
 
 
+# --- Links de busca em portais de imóveis (distrito + tipo + faixa de preço) ---
+# Zona oficial de cada distrito (fonte: GeoSampa, campo nm_regiao_05).
+DISTRITO_ZONA = {
+    "AGUA RASA": "Leste", "ALTO DE PINHEIROS": "Oeste", "ANHANGUERA": "Norte",
+    "ARICANDUVA": "Leste", "ARTUR ALVIM": "Leste", "BARRA FUNDA": "Oeste",
+    "BELA VISTA": "Centro", "BELEM": "Leste", "BOM RETIRO": "Centro", "BRAS": "Leste",
+    "BRASILANDIA": "Norte", "BUTANTA": "Oeste", "CACHOEIRINHA": "Norte",
+    "CAMBUCI": "Centro", "CAMPO BELO": "Sul", "CAMPO GRANDE": "Sul", "CAMPO LIMPO": "Sul",
+    "CANGAIBA": "Leste", "CAPAO REDONDO": "Sul", "CARRAO": "Leste", "CASA VERDE": "Norte",
+    "CIDADE ADEMAR": "Sul", "CIDADE DUTRA": "Sul", "CIDADE LIDER": "Leste",
+    "CIDADE TIRADENTES": "Leste", "CONSOLACAO": "Centro", "CURSINO": "Sul",
+    "ERMELINO MATARAZZO": "Leste", "FREGUESIA DO O": "Norte", "GRAJAU": "Sul",
+    "GUAIANASES": "Leste", "IGUATEMI": "Leste", "IPIRANGA": "Sul", "ITAIM BIBI": "Oeste",
+    "ITAIM PAULISTA": "Leste", "ITAQUERA": "Leste", "JABAQUARA": "Sul", "JACANA": "Norte",
+    "JAGUARA": "Oeste", "JAGUARE": "Oeste", "JARAGUA": "Norte", "JARDIM ANGELA": "Sul",
+    "JARDIM HELENA": "Leste", "JARDIM PAULISTA": "Oeste", "JARDIM SAO LUIS": "Sul",
+    "JOSE BONIFACIO": "Leste", "LAJEADO": "Leste", "LAPA": "Oeste", "LIBERDADE": "Centro",
+    "LIMAO": "Norte", "MANDAQUI": "Norte", "MARSILAC": "Sul", "MOEMA": "Sul",
+    "MOOCA": "Leste", "MORUMBI": "Oeste", "PARELHEIROS": "Sul", "PARI": "Leste",
+    "PARQUE DO CARMO": "Leste", "PEDREIRA": "Sul", "PENHA": "Leste", "PERDIZES": "Oeste",
+    "PERUS": "Norte", "PINHEIROS": "Oeste", "PIRITUBA": "Norte", "PONTE RASA": "Leste",
+    "RAPOSO TAVARES": "Oeste", "REPUBLICA": "Centro", "RIO PEQUENO": "Oeste",
+    "SACOMA": "Sul", "SANTA CECILIA": "Centro", "SANTANA": "Norte", "SANTO AMARO": "Sul",
+    "SAO DOMINGOS": "Norte", "SAO LUCAS": "Leste", "SAO MATEUS": "Leste",
+    "SAO MIGUEL": "Leste", "SAO RAFAEL": "Leste", "SAPOPEMBA": "Leste", "SAUDE": "Sul",
+    "SE": "Centro", "SOCORRO": "Sul", "TATUAPE": "Leste", "TREMEMBE": "Norte",
+    "TUCURUVI": "Norte", "VILA ANDRADE": "Sul", "VILA CURUCA": "Leste",
+    "VILA FORMOSA": "Leste", "VILA GUILHERME": "Norte", "VILA JACUI": "Leste",
+    "VILA LEOPOLDINA": "Oeste", "VILA MARIA": "Norte", "VILA MARIANA": "Sul",
+    "VILA MATILDE": "Leste", "VILA MEDEIROS": "Norte", "VILA PRUDENTE": "Leste",
+    "VILA SONIA": "Oeste",
+}
+
+
+def _slug(texto):
+    """Converte 'Alto de Pinheiros' -> 'alto-de-pinheiros' (para URLs de portais)."""
+    t = remover_acentos(texto).lower().strip()
+    return "-".join(t.split())
+
+
+def links_portais(distrito, tipo, preco_min=None, preco_max=None):
+    """Monta URLs de busca para QuintoAndar, Viva Real e ZAP a partir do distrito,
+    do tipo de imóvel e (quando houver) da faixa de preço estimada. Os portais
+    mudam de estrutura ao longo do tempo; estes links usam o padrão de busca por
+    bairro de São Paulo e devem levar à região certa — o usuário refina no site.
+    Retorna lista de dicts {nome, url}."""
+    from urllib.parse import quote
+
+    bairro_slug = _slug(distrito)
+    # normaliza o tipo para cada portal (casa x apartamento)
+    eh_apto = (tipo == "Apartamentos")
+    links = []
+
+    # --- Viva Real ---
+    vr_tipo = "apartamento_residencial" if eh_apto else "casa_residencial"
+    vr = (f"https://www.vivareal.com.br/venda/sao-paulo/sao-paulo/bairros/"
+          f"{bairro_slug}/{vr_tipo}/")
+    params_vr = []
+    if preco_min:
+        params_vr.append(f"preco-desde={int(preco_min)}")
+    if preco_max:
+        params_vr.append(f"preco-ate={int(preco_max)}")
+    if params_vr:
+        vr += "?" + "&".join(params_vr)
+    links.append({"nome": "Viva Real", "url": vr})
+
+    # --- ZAP Imóveis (mesma família da Viva Real, estrutura parecida) ---
+    # descobre a zona oficial do distrito (nm_regiao_05 do GeoSampa) e monta o
+    # trecho de zona da URL. "Centro" no ZAP não usa o prefixo "zona-".
+    zona_nome = DISTRITO_ZONA.get(remover_acentos(distrito), "")
+    if zona_nome == "Centro":
+        zona_slug = "centro"
+    elif zona_nome:
+        zona_slug = f"zona-{_slug(zona_nome)}"
+    else:
+        zona_slug = ""  # distrito não mapeado: omite a zona (link mais amplo, não quebra)
+
+    zap_tipo = "apartamento_residencial" if eh_apto else "casa_residencial"
+    if zona_slug:
+        zap = (f"https://www.zapimoveis.com.br/venda/{zap_tipo}/"
+               f"sp+sao-paulo+{zona_slug}+{bairro_slug}/")
+    else:
+        zap = (f"https://www.zapimoveis.com.br/venda/{zap_tipo}/"
+               f"sp+sao-paulo+{bairro_slug}/")
+    params_zap = []
+    if preco_min:
+        params_zap.append(f"precoMinimo={int(preco_min)}")
+    if preco_max:
+        params_zap.append(f"precoMaximo={int(preco_max)}")
+    if params_zap:
+        zap += "?" + "&".join(params_zap)
+    links.append({"nome": "ZAP Imóveis", "url": zap})
+
+    # --- QuintoAndar (usa busca por texto; filtros na própria página) ---
+    qa_tipo = "apartamentos" if eh_apto else "casas"
+    qa = (f"https://www.quintoandar.com.br/comprar/imovel/"
+          f"{bairro_slug}-sao-paulo-sp-brasil/{qa_tipo}")
+    links.append({"nome": "QuintoAndar", "url": qa})
+
+    return links
+
+
 # --- Pontos de interesse (POIs) via OpenStreetMap / Overpass API ---
 # Cada categoria define: rótulo, cor, ícone (folium/glyphicon) e os filtros OSM.
 POI_CATEGORIAS = {
@@ -998,6 +1100,27 @@ if rua or distrito_alvo != "Selecione...":
         else:
             st.info("💡 Informe a **área construída** e/ou **área de terreno** na barra lateral "
                     "para obter a faixa de valor estimada do imóvel.")
+
+        # ---- ANÚNCIOS DE IMÓVEIS NA REGIÃO (links para portais) ----
+        # só faz sentido quando há um distrito selecionado (modo distrito)
+        if not rua and distrito_alvo != "Selecione...":
+            # usa a faixa de valor estimada como filtro de preço, se existir
+            pmin = pmax = None
+            if faixas_estimadas:
+                pmin = int(np.mean([f[1] for f in faixas_estimadas]))
+                pmax = int(np.mean([f[2] for f in faixas_estimadas]))
+            portais = links_portais(distrito_alvo, tipo, pmin, pmax)
+
+            st.markdown("### 🔎 Ver anúncios à venda na região")
+            cols_links = st.columns(len(portais))
+            for col, p in zip(cols_links, portais):
+                col.link_button(p["nome"], p["url"], use_container_width=True)
+            filtro_txt = f"{tipo.lower()}"
+            if pmin and pmax:
+                filtro_txt += f" · {formata_moeda(pmin)} a {formata_moeda(pmax)}"
+            st.caption(f"Busca aberta em {distrito_alvo} ({filtro_txt}). Os portais "
+                       "atualizam suas URLs periodicamente; se um filtro não vier "
+                       "aplicado, refine na própria página do portal.")
 
         # ---- INDICADORES DE MERCADO (sempre por MÉDIA) ----
         st.markdown("### 📊 Indicadores de mercado (R$/m²)")
