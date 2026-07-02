@@ -229,6 +229,33 @@ def carregar_geojson_distritos(caminho):
 DISTRITOS_GEO, _ = carregar_geojson_distritos(GEOJSON_DISTRITOS)
 
 
+# --- GeoJSON das quadras (para valorização por quarteirão) ---
+GEOJSON_QUADRAS = os.path.join(APP_DIR, "quadras_sp.geojson")
+if not os.path.exists(GEOJSON_QUADRAS):
+    GEOJSON_QUADRAS = "quadras_sp.geojson"
+
+
+@st.cache_data(show_spinner=False)
+def carregar_geojson_quadras(caminho):
+    """Carrega o GeoJSON das quadras uma vez e indexa por código de quadra
+    (setor+quadra, 6 dígitos). Retorna dict {codigo: geometry_dict} ou {}."""
+    try:
+        import json
+        with open(caminho, "r", encoding="utf-8") as fh:
+            fc = json.load(fh)
+        por_codigo = {}
+        for feat in fc.get("features", []):
+            cod = feat.get("properties", {}).get("Quadra")
+            if cod:
+                por_codigo[str(cod)] = feat.get("geometry")
+        return por_codigo
+    except Exception:
+        return {}
+
+
+QUADRAS_GEO = carregar_geojson_quadras(GEOJSON_QUADRAS)
+
+
 # --- Zoneamento (LPUOS 2016) buscado sob demanda por área, direto do GeoSampa ---
 WFS_GEOSAMPA = "http://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
 CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
@@ -372,30 +399,26 @@ def bbox_de_feature(feature):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
-# --- Grade de valorização (% a.a. por célula) ---
-VALOR_CELULA_GRAUS = 0.00135   # ~150 m (lado da célula da grade)
-VALOR_MIN_TRANSACOES = 5       # mínimo de transações na célula
-VALOR_MIN_ANOS = 3             # mínimo de anos distintos na célula
+# --- Valorização por quadra (quarteirão) ---
+VALOR_MIN_TRANSACOES = 5       # mínimo de transações na quadra
+VALOR_MIN_ANOS = 3             # mínimo de anos distintos na quadra
 
 
-def grade_valorizacao(df_pts):
-    """Divide os pontos numa grade e calcula a valorização anual (% a.a.) por
-    célula via regressão log(preço/m²) ~ ano. Retorna lista de células:
-    (lat_centro, lon_centro, valorizacao_aa, n). Só inclui células com dados
-    suficientes (nº de transações e anos distintos), para evitar ruído."""
-    d = df_pts.dropna(subset=["Latitude", "Longitude", "Preco_m2", "Ano_Transacao"]).copy()
+def valorizacao_por_quadra(df_pts):
+    """Agrupa as transações pela coluna Quadra (setor+quadra) e calcula a
+    valorização anual (% a.a.) de cada quarteirão via regressão log(preço/m²) ~ ano.
+    Retorna dict {codigo_quadra: (valorizacao_aa, n)} só para quadras com dados
+    suficientes (nº de transações e anos distintos)."""
+    if "Quadra" not in df_pts.columns:
+        return {}
+    d = df_pts.dropna(subset=["Quadra", "Preco_m2", "Ano_Transacao"]).copy()
     d = d[d["Preco_m2"] > 0]
     if d.empty:
-        return []
-
-    passo = VALOR_CELULA_GRAUS
-    # índice da célula na grade (arredonda coordenada para o canto da célula)
-    d["_gx"] = np.floor(d["Longitude"] / passo).astype(int)
-    d["_gy"] = np.floor(d["Latitude"] / passo).astype(int)
+        return {}
     d["_ano"] = d["Ano_Transacao"].astype(int)
 
-    celulas = []
-    for (gx, gy), grupo in d.groupby(["_gx", "_gy"]):
+    resultado = {}
+    for cod, grupo in d.groupby("Quadra"):
         if len(grupo) < VALOR_MIN_TRANSACOES:
             continue
         if grupo["_ano"].nunique() < VALOR_MIN_ANOS:
@@ -407,10 +430,8 @@ def grade_valorizacao(df_pts):
         except Exception:
             continue
         val_aa = float(np.exp(slope) - 1.0)   # valorização anual composta
-        lat_centro = (gy + 0.5) * passo
-        lon_centro = (gx + 0.5) * passo
-        celulas.append((lat_centro, lon_centro, val_aa, len(grupo)))
-    return celulas
+        resultado[str(cod)] = (val_aa, len(grupo))
+    return resultado
 
 
 # --- Pontos de interesse (POIs) via OpenStreetMap / Overpass API ---
@@ -590,7 +611,7 @@ heatmap_modo = st.sidebar.radio(
     help=("Densidade: regiões com mais transações ficam quentes. "
           "Preço/m² de terreno: regiões mais caras ficam quentes. "
           "Valorização: regiões que mais subiram de preço ao ano ficam quentes "
-          "(grade por célula, via tendência histórica)."),
+          "(por quarteirão, via tendência histórica)."),
 )
 
 st.sidebar.markdown("---")
@@ -1151,15 +1172,18 @@ if rua or distrito_alvo != "Selecione...":
                                    "de terreno fracionada e podem distorcer — filtre por "
                                    "'Residenciais' para uma leitura mais limpa.")
                 elif heatmap_modo == "Valorização (% a.a.)":
-                    # grade de células coloridas pela valorização anual (regressão por célula)
-                    celulas = grade_valorizacao(df_geo)
-                    if not celulas:
-                        st.caption("ℹ️ Sem células com dados suficientes para calcular "
+                    # valorização por QUARTEIRÃO: cor no polígono real da quadra
+                    val_quadras = valorizacao_por_quadra(df_geo)
+                    if not val_quadras:
+                        st.caption("ℹ️ Sem quadras com dados suficientes para calcular "
                                    "valorização neste recorte (é preciso ao menos "
                                    f"{VALOR_MIN_TRANSACOES} transações em "
-                                   f"{VALOR_MIN_ANOS} anos por célula).")
+                                   f"{VALOR_MIN_ANOS} anos por quarteirão).")
+                    elif not QUADRAS_GEO:
+                        st.caption("ℹ️ Arquivo de polígonos das quadras (quadras_sp.geojson) "
+                                   "não encontrado no repositório.")
                     else:
-                        vals = np.array([c[2] for c in celulas])
+                        vals = np.array([v[0] for v in val_quadras.values()])
                         # escala de cor simétrica em torno de 0, cortando extremos (p10–p90)
                         lim = max(abs(np.quantile(vals, 0.10)), abs(np.quantile(vals, 0.90)))
                         lim = lim if lim > 0 else (abs(vals).max() or 0.01)
@@ -1168,34 +1192,40 @@ if rua or distrito_alvo != "Selecione...":
                             # vermelho (desvaloriza) -> cinza (estável) -> verde (valoriza)
                             t = max(-1.0, min(1.0, v / lim))
                             if t >= 0:
-                                # cinza -> verde
                                 r = int(158 + (26 - 158) * t)
                                 g = int(158 + (152 - 158) * t)
                                 b = int(158 + (80 - 158) * t)
                             else:
-                                # cinza -> vermelho
                                 r = int(158 + (215 - 158) * (-t))
                                 g = int(158 + (48 - 158) * (-t))
                                 b = int(158 + (39 - 158) * (-t))
                             return f"#{r:02x}{g:02x}{b:02x}"
 
-                        passo = VALOR_CELULA_GRAUS
-                        for lat_c2, lon_c2, val_aa, n in celulas:
+                        desenhadas = 0
+                        for cod, (val_aa, n) in val_quadras.items():
+                            geom = QUADRAS_GEO.get(cod)
+                            if geom is None:
+                                continue  # quadra sem polígono no GeoJSON
                             cor = _cor_val(val_aa)
-                            bounds = [[lat_c2 - passo / 2, lon_c2 - passo / 2],
-                                      [lat_c2 + passo / 2, lon_c2 + passo / 2]]
-                            folium.Rectangle(
-                                bounds, color=cor, weight=0.5, fill=True,
-                                fill_color=cor, fill_opacity=0.55,
+                            folium.GeoJson(
+                                {"type": "Feature", "geometry": geom, "properties": {}},
+                                style_function=lambda _f, _c=cor: {
+                                    "color": _c, "weight": 0.5,
+                                    "fill": True, "fillColor": _c, "fillOpacity": 0.6,
+                                },
+                                tooltip=f"{val_aa*100:+.1f}% a.a. ({n} transações)",
                                 popup=folium.Popup(
+                                    f"<b>Quarteirão:</b> {cod}<br>"
                                     f"<b>Valorização:</b> {val_aa*100:+.1f}% a.a.<br>"
-                                    f"<b>Transações:</b> {n}", max_width=200),
+                                    f"<b>Transações:</b> {n}", max_width=220),
                             ).add_to(m)
+                            desenhadas += 1
 
                         med = np.median(vals) * 100
-                        st.caption(f"🔥 **Valorização por célula (~150 m)**: verde = subindo, "
-                                   f"vermelho = caindo, cinza = estável. Mediana das células: "
-                                   f"{med:+.1f}% a.a. Células com poucos dados foram ocultadas.")
+                        st.caption(f"🔥 **Valorização por quarteirão**: verde = subindo, "
+                                   f"vermelho = caindo, cinza = estável. {desenhadas} quarteirões "
+                                   f"com dados · mediana {med:+.1f}% a.a. Quadras com poucas "
+                                   f"transações foram ocultadas.")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
