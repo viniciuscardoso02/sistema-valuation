@@ -624,14 +624,24 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔥 Mapa de Calor")
 heatmap_modo = st.sidebar.radio(
     "Camada de calor no mapa",
-    ["Desligado", "Densidade de transações", "Preço/m² de terreno",
-     "Valorização (% a.a.)", "Modernização (contagem)"],
+    ["Desligado", "Densidade de transações", "Preço/m² de terreno"],
     help=("Densidade: regiões com mais transações ficam quentes. "
-          "Preço/m² de terreno: regiões mais caras ficam quentes. "
-          "Valorização: regiões que mais subiram de preço ao ano ficam quentes "
-          "(por quarteirão, via tendência histórica). "
-          "Modernização: quarteirões coloridos pela quantidade de imóveis "
-          "modernizados (independe do filtro de status)."),
+          "Preço/m² de terreno: regiões mais caras ficam quentes."),
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🧱 Camadas por Quarteirão")
+st.sidebar.caption("Podem ser combinadas: a **cor** mostra valorização e a "
+                   "**borda** destaca modernização.")
+mostrar_valorizacao = st.sidebar.checkbox(
+    "Valorização (% a.a.) — cor do quarteirão", value=False,
+    help="Colore cada quarteirão pela tendência de preço/m² ao ano "
+         "(verde = subindo, vermelho = caindo).",
+)
+mostrar_modernizacao = st.sidebar.checkbox(
+    "Modernização — borda destacada", value=False,
+    help="Destaca com borda os quarteirões que tiveram imóveis modernizados. "
+         "Independe do filtro de status.",
 )
 
 st.sidebar.markdown("---")
@@ -1195,119 +1205,122 @@ if rua or distrito_alvo != "Selecione...":
                                    "indicam terreno mais caro na região. Apartamentos têm área "
                                    "de terreno fracionada e podem distorcer — filtre por "
                                    "'Residenciais' para uma leitura mais limpa.")
-                elif heatmap_modo == "Valorização (% a.a.)":
-                    # valorização por QUARTEIRÃO: cor no polígono real da quadra
-                    val_quadras = valorizacao_por_quadra(df_geo)
-                    if not val_quadras:
-                        st.caption("ℹ️ Sem quadras com dados suficientes para calcular "
-                                   "valorização neste recorte (é preciso ao menos "
-                                   f"{VALOR_MIN_TRANSACOES} transações em "
-                                   f"{VALOR_MIN_ANOS} anos por quarteirão).")
-                    elif not QUADRAS_GEO:
-                        st.caption("ℹ️ Arquivo de polígonos das quadras (quadras_sp.geojson) "
-                                   "não encontrado no repositório.")
-                    else:
-                        vals = np.array([v[0] for v in val_quadras.values()])
-                        # escala de cor simétrica em torno de 0, cortando extremos (p10–p90)
-                        lim = max(abs(np.quantile(vals, 0.10)), abs(np.quantile(vals, 0.90)))
-                        lim = lim if lim > 0 else (abs(vals).max() or 0.01)
+            # --- Camadas por quarteirão: valorização (cor) + modernização (borda) ---
+            # As duas são combináveis: cada quarteirão é desenhado UMA vez, com a
+            # cor de preenchimento vinda da valorização e a borda vinda da modernização.
+            if (mostrar_valorizacao or mostrar_modernizacao):
+                if not QUADRAS_GEO:
+                    st.caption("ℹ️ Arquivo de polígonos das quadras (quadras_sp.geojson) "
+                               "não encontrado no repositório.")
+                else:
+                    # (a) valorização por quadra (só se marcada)
+                    val_quadras = valorizacao_por_quadra(df_geo) if mostrar_valorizacao else {}
+                    lim_val = None
+                    if val_quadras:
+                        _vals = np.array([v[0] for v in val_quadras.values()])
+                        lim_val = max(abs(np.quantile(_vals, 0.10)),
+                                      abs(np.quantile(_vals, 0.90)))
+                        lim_val = lim_val if lim_val > 0 else (abs(_vals).max() or 0.01)
 
-                        def _cor_val(v):
-                            # vermelho (desvaloriza) -> cinza (estável) -> verde (valoriza)
-                            t = max(-1.0, min(1.0, v / lim))
-                            if t >= 0:
-                                r = int(158 + (26 - 158) * t)
-                                g = int(158 + (152 - 158) * t)
-                                b = int(158 + (80 - 158) * t)
-                            else:
-                                r = int(158 + (215 - 158) * (-t))
-                                g = int(158 + (48 - 158) * (-t))
-                                b = int(158 + (39 - 158) * (-t))
-                            return f"#{r:02x}{g:02x}{b:02x}"
+                    def _cor_val(v):
+                        # vermelho (desvaloriza) -> cinza (estável) -> verde (valoriza)
+                        t = max(-1.0, min(1.0, v / lim_val))
+                        if t >= 0:
+                            r = int(158 + (26 - 158) * t)
+                            g = int(158 + (152 - 158) * t)
+                            b = int(158 + (80 - 158) * t)
+                        else:
+                            r = int(158 + (215 - 158) * (-t))
+                            g = int(158 + (48 - 158) * (-t))
+                            b = int(158 + (39 - 158) * (-t))
+                        return f"#{r:02x}{g:02x}{b:02x}"
 
-                        desenhadas = 0
-                        for cod, (val_aa, n) in val_quadras.items():
-                            geom = QUADRAS_GEO.get(cod)
-                            if geom is None:
-                                continue  # quadra sem polígono no GeoJSON
-                            cor = _cor_val(val_aa)
-                            folium.GeoJson(
-                                {"type": "Feature", "geometry": geom, "properties": {}},
-                                style_function=lambda _f, _c=cor: {
-                                    "color": _c, "weight": 0.5,
-                                    "fill": True, "fillColor": _c, "fillOpacity": 0.6,
-                                },
-                                tooltip=f"{val_aa*100:+.1f}% a.a. ({n} transações)",
-                                popup=folium.Popup(
-                                    f"<b>Quarteirão:</b> {cod}<br>"
-                                    f"<b>Valorização:</b> {val_aa*100:+.1f}% a.a.<br>"
-                                    f"<b>Transações:</b> {n}", max_width=220),
-                            ).add_to(m)
-                            desenhadas += 1
+                    # (b) modernização por quadra (só se marcada) — base ANTES do filtro de status
+                    mod_quadras = {}
+                    if mostrar_modernizacao:
+                        codigos_visiveis = set(df_geo["Quadra"].dropna().astype(str)) \
+                            if "Quadra" in df_geo.columns else set()
+                        base_mod = df_sem_filtro_status
+                        if codigos_visiveis and "Quadra" in base_mod.columns:
+                            base_mod = base_mod[base_mod["Quadra"].astype(str).isin(codigos_visiveis)]
+                        mod_quadras = modernizacao_por_quadra(base_mod)
+                    lim_mod = None
+                    if mod_quadras:
+                        _counts = np.array([v[0] for v in mod_quadras.values()])
+                        lim_mod = max(1.0, float(np.quantile(_counts, 0.90)))
 
-                        med = np.median(vals) * 100
-                        st.caption(f"🔥 **Valorização por quarteirão**: verde = subindo, "
-                                   f"vermelho = caindo, cinza = estável. {desenhadas} quarteirões "
-                                   f"com dados · mediana {med:+.1f}% a.a. Quadras com poucas "
-                                   f"transações foram ocultadas.")
+                    # (c) conjunto de quadras a desenhar = união das duas métricas
+                    codigos = set(val_quadras.keys()) | set(mod_quadras.keys())
+                    desenhadas = 0
+                    for cod in codigos:
+                        geom = QUADRAS_GEO.get(cod)
+                        if geom is None:
+                            continue
 
-                elif heatmap_modo == "Modernização (contagem)":
-                    # quarteirões coloridos pela QUANTIDADE de imóveis modernizados.
-                    # usa a base ANTES do filtro de status (df_sem_filtro_status),
-                    # recortada para a mesma área exibida no mapa (df_geo).
-                    codigos_visiveis = set(df_geo["Quadra"].dropna().astype(str)) \
-                        if "Quadra" in df_geo.columns else set()
-                    base_mod = df_sem_filtro_status
-                    if codigos_visiveis and "Quadra" in base_mod.columns:
-                        base_mod = base_mod[base_mod["Quadra"].astype(str).isin(codigos_visiveis)]
-                    mod_quadras = modernizacao_por_quadra(base_mod)
+                        # preenchimento pela valorização (cinza neutro se sem valor)
+                        if cod in val_quadras:
+                            val_aa, n_val = val_quadras[cod]
+                            fill_cor = _cor_val(val_aa)
+                            fill_op = 0.6
+                        else:
+                            val_aa, n_val = None, None
+                            fill_cor = "#9e9e9e"
+                            fill_op = 0.12  # quase transparente quando só há borda
 
-                    if not mod_quadras:
-                        st.caption("ℹ️ Nenhum imóvel modernizado identificado neste recorte.")
-                    elif not QUADRAS_GEO:
-                        st.caption("ℹ️ Arquivo de polígonos das quadras (quadras_sp.geojson) "
-                                   "não encontrado no repositório.")
-                    else:
-                        counts = np.array([v[0] for v in mod_quadras.values()])
-                        # escala de cor: do amarelo claro (poucos) ao vermelho forte (muitos),
-                        # limitada no p90 para não saturar por causa de uma quadra atípica
-                        lim = max(1.0, float(np.quantile(counts, 0.90)))
+                        # borda pela modernização (azul destacado; espessura ~ contagem)
+                        if cod in mod_quadras:
+                            n_mod, n_tot_mod = mod_quadras[cod]
+                            intens = min(1.0, n_mod / lim_mod)
+                            borda_cor = "#08519c"                 # azul forte
+                            borda_peso = 1.5 + 3.5 * intens        # 1.5 a 5 px
+                        else:
+                            n_mod, n_tot_mod = None, None
+                            borda_cor = "#00000030"                # borda neutra discreta
+                            borda_peso = 0.4
 
-                        def _cor_mod(qtd):
-                            t = min(1.0, qtd / lim)
-                            # amarelo (#ffeda0) -> laranja/vermelho (#f03b20)
-                            r = int(255 + (240 - 255) * t)
-                            g = int(237 + (59 - 237) * t)
-                            b = int(160 + (32 - 160) * t)
-                            return f"#{r:02x}{g:02x}{b:02x}"
+                        # popup combinando o que houver
+                        linhas_popup = [f"<b>Quarteirão:</b> {cod}"]
+                        if val_aa is not None:
+                            linhas_popup.append(f"<b>Valorização:</b> {val_aa*100:+.1f}% a.a. "
+                                                f"({n_val} transações)")
+                        if n_mod is not None:
+                            pct = (n_mod / n_tot_mod * 100) if n_tot_mod else 0
+                            linhas_popup.append(f"<b>Modernizados:</b> {n_mod} de {n_tot_mod} "
+                                                f"({pct:.0f}%)")
+                        popup_html = "<br>".join(linhas_popup)
 
-                        desenhadas = 0
-                        for cod, (n_mod, n_total) in mod_quadras.items():
-                            geom = QUADRAS_GEO.get(cod)
-                            if geom is None:
-                                continue
-                            cor = _cor_mod(n_mod)
-                            pct = (n_mod / n_total * 100) if n_total else 0
-                            folium.GeoJson(
-                                {"type": "Feature", "geometry": geom, "properties": {}},
-                                style_function=lambda _f, _c=cor: {
-                                    "color": _c, "weight": 0.5,
-                                    "fill": True, "fillColor": _c, "fillOpacity": 0.6,
-                                },
-                                tooltip=f"{n_mod} modernizado(s)",
-                                popup=folium.Popup(
-                                    f"<b>Quarteirão:</b> {cod}<br>"
-                                    f"<b>Modernizados:</b> {n_mod}<br>"
-                                    f"<b>Total de transações:</b> {n_total}<br>"
-                                    f"<b>Proporção:</b> {pct:.0f}%", max_width=220),
-                            ).add_to(m)
-                            desenhadas += 1
+                        folium.GeoJson(
+                            {"type": "Feature", "geometry": geom, "properties": {}},
+                            style_function=lambda _f, _fc=fill_cor, _fo=fill_op,
+                                                   _bc=borda_cor, _bp=borda_peso: {
+                                "color": _bc, "weight": _bp,
+                                "fill": True, "fillColor": _fc, "fillOpacity": _fo,
+                            },
+                            popup=folium.Popup(popup_html, max_width=230),
+                        ).add_to(m)
+                        desenhadas += 1
 
-                        total_mod = int(counts.sum())
-                        st.caption(f"🔥 **Modernização por quarteirão**: quanto mais forte a cor, "
-                                   f"mais imóveis modernizados. {desenhadas} quarteirões com ao "
-                                   f"menos 1 modernizado · {total_mod} imóveis modernizados no "
-                                   f"total. Esta camada **não** depende do filtro de status.")
+                    # legenda/resumo conforme o que está ativo
+                    partes_cap = []
+                    if mostrar_valorizacao:
+                        if val_quadras:
+                            med = np.median([v[0] for v in val_quadras.values()]) * 100
+                            partes_cap.append(f"**cor** = valorização (verde sobe, vermelho cai; "
+                                              f"mediana {med:+.1f}% a.a.)")
+                        else:
+                            partes_cap.append("**cor** = valorização (sem quadras com dados "
+                                              "suficientes neste recorte)")
+                    if mostrar_modernizacao:
+                        if mod_quadras:
+                            total_mod = int(sum(v[0] for v in mod_quadras.values()))
+                            partes_cap.append(f"**borda azul** = modernização "
+                                              f"({total_mod} imóveis modernizados; borda mais "
+                                              f"grossa = mais retrofit)")
+                        else:
+                            partes_cap.append("**borda azul** = modernização (nenhum modernizado "
+                                              "neste recorte)")
+                    if partes_cap:
+                        st.caption("🧱 Camadas por quarteirão — " + " · ".join(partes_cap) + ".")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
