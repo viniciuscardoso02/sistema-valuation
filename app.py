@@ -434,6 +434,24 @@ def valorizacao_por_quadra(df_pts):
     return resultado
 
 
+def modernizacao_por_quadra(df_pts):
+    """Conta imóveis modernizados por quadra (setor+quadra). Usa a base ANTES do
+    filtro de status, para mostrar onde há modernização independentemente do
+    filtro selecionado. Retorna dict {codigo_quadra: (n_modernizados, n_total)}
+    apenas para quadras que têm ao menos 1 modernizado."""
+    if "Quadra" not in df_pts.columns or "Status" not in df_pts.columns:
+        return {}
+    d = df_pts.dropna(subset=["Quadra"]).copy()
+    if d.empty:
+        return {}
+    resultado = {}
+    for cod, grupo in d.groupby("Quadra"):
+        n_mod = int((grupo["Status"] == "Modernizado").sum())
+        if n_mod >= 1:
+            resultado[str(cod)] = (n_mod, len(grupo))
+    return resultado
+
+
 # --- Pontos de interesse (POIs) via OpenStreetMap / Overpass API ---
 # Cada categoria define: rótulo, cor, ícone (folium/glyphicon) e os filtros OSM.
 POI_CATEGORIAS = {
@@ -607,11 +625,13 @@ st.sidebar.header("🔥 Mapa de Calor")
 heatmap_modo = st.sidebar.radio(
     "Camada de calor no mapa",
     ["Desligado", "Densidade de transações", "Preço/m² de terreno",
-     "Valorização (% a.a.)"],
+     "Valorização (% a.a.)", "Modernização (contagem)"],
     help=("Densidade: regiões com mais transações ficam quentes. "
           "Preço/m² de terreno: regiões mais caras ficam quentes. "
           "Valorização: regiões que mais subiram de preço ao ano ficam quentes "
-          "(por quarteirão, via tendência histórica)."),
+          "(por quarteirão, via tendência histórica). "
+          "Modernização: quarteirões coloridos pela quantidade de imóveis "
+          "modernizados (independe do filtro de status)."),
 )
 
 st.sidebar.markdown("---")
@@ -894,6 +914,10 @@ if rua or distrito_alvo != "Selecione...":
         df["Status"] = np.where(eh_modernizado, "Modernizado", "Antigo")
 
         df = df.drop(columns=["Chave_Imovel"], errors="ignore")
+
+        # guarda a base COM classificação mas ANTES do filtro de status, para a
+        # camada de "Modernização" contar modernizados independentemente do filtro
+        df_sem_filtro_status = df.copy()
 
         # 8.8 filtro de status (Todos / Só modernizados / Só antigos)
         if filtro_status == "Só modernizados":
@@ -1226,6 +1250,64 @@ if rua or distrito_alvo != "Selecione...":
                                    f"vermelho = caindo, cinza = estável. {desenhadas} quarteirões "
                                    f"com dados · mediana {med:+.1f}% a.a. Quadras com poucas "
                                    f"transações foram ocultadas.")
+
+                elif heatmap_modo == "Modernização (contagem)":
+                    # quarteirões coloridos pela QUANTIDADE de imóveis modernizados.
+                    # usa a base ANTES do filtro de status (df_sem_filtro_status),
+                    # recortada para a mesma área exibida no mapa (df_geo).
+                    codigos_visiveis = set(df_geo["Quadra"].dropna().astype(str)) \
+                        if "Quadra" in df_geo.columns else set()
+                    base_mod = df_sem_filtro_status
+                    if codigos_visiveis and "Quadra" in base_mod.columns:
+                        base_mod = base_mod[base_mod["Quadra"].astype(str).isin(codigos_visiveis)]
+                    mod_quadras = modernizacao_por_quadra(base_mod)
+
+                    if not mod_quadras:
+                        st.caption("ℹ️ Nenhum imóvel modernizado identificado neste recorte.")
+                    elif not QUADRAS_GEO:
+                        st.caption("ℹ️ Arquivo de polígonos das quadras (quadras_sp.geojson) "
+                                   "não encontrado no repositório.")
+                    else:
+                        counts = np.array([v[0] for v in mod_quadras.values()])
+                        # escala de cor: do amarelo claro (poucos) ao vermelho forte (muitos),
+                        # limitada no p90 para não saturar por causa de uma quadra atípica
+                        lim = max(1.0, float(np.quantile(counts, 0.90)))
+
+                        def _cor_mod(qtd):
+                            t = min(1.0, qtd / lim)
+                            # amarelo (#ffeda0) -> laranja/vermelho (#f03b20)
+                            r = int(255 + (240 - 255) * t)
+                            g = int(237 + (59 - 237) * t)
+                            b = int(160 + (32 - 160) * t)
+                            return f"#{r:02x}{g:02x}{b:02x}"
+
+                        desenhadas = 0
+                        for cod, (n_mod, n_total) in mod_quadras.items():
+                            geom = QUADRAS_GEO.get(cod)
+                            if geom is None:
+                                continue
+                            cor = _cor_mod(n_mod)
+                            pct = (n_mod / n_total * 100) if n_total else 0
+                            folium.GeoJson(
+                                {"type": "Feature", "geometry": geom, "properties": {}},
+                                style_function=lambda _f, _c=cor: {
+                                    "color": _c, "weight": 0.5,
+                                    "fill": True, "fillColor": _c, "fillOpacity": 0.6,
+                                },
+                                tooltip=f"{n_mod} modernizado(s)",
+                                popup=folium.Popup(
+                                    f"<b>Quarteirão:</b> {cod}<br>"
+                                    f"<b>Modernizados:</b> {n_mod}<br>"
+                                    f"<b>Total de transações:</b> {n_total}<br>"
+                                    f"<b>Proporção:</b> {pct:.0f}%", max_width=220),
+                            ).add_to(m)
+                            desenhadas += 1
+
+                        total_mod = int(counts.sum())
+                        st.caption(f"🔥 **Modernização por quarteirão**: quanto mais forte a cor, "
+                                   f"mais imóveis modernizados. {desenhadas} quarteirões com ao "
+                                   f"menos 1 modernizado · {total_mod} imóveis modernizados no "
+                                   f"total. Esta camada **não** depende do filtro de status.")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
