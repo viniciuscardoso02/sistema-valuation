@@ -509,29 +509,55 @@ def alvaras_por_quadra(alvaras_df, familia="Reforma", quadras_visiveis=None):
 def _html_popup_alvaras(quadra, familia, grupo):
     """Monta o HTML do popup listando os alvarás de uma família num quarteirão.
     Recebe 'grupo' já filtrado (quadra+família) para não refiltrar a base a cada
-    círculo. Uma linha por processo único, Ano · Fase · Segmento · SQL · Nº,
-    ordenado do mais recente para o mais antigo, com rolagem se for longo."""
+    círculo. Uma linha por processo único, com Rua, Mês/Ano, Fase, Segmento, SQL e
+    Nº do processo. Ordenado do mais recente para o mais antigo, rola se for longo."""
     d = grupo
     if d.empty:
         return f"<b>Quarteirão {quadra} — {familia}</b><br>Sem alvarás."
     if "Processo Aprova Digital" in d.columns:
         d = d.drop_duplicates("Processo Aprova Digital")
-    d = d.assign(_ano=pd.to_numeric(d["Ano_Alvara"], errors="coerce"))
-    d = d.sort_values("_ano", ascending=False, na_position="last")
+    d = d.assign(
+        _ano=pd.to_numeric(d["Ano_Alvara"], errors="coerce"),
+        _mes=pd.to_numeric(d.get("Mes_Alvara"), errors="coerce"),
+    )
+    d = d.sort_values(["_ano", "_mes"], ascending=False, na_position="last")
+
+    def _competencia(r):
+        # monta "mm/aaaa" tratando o .0 que vem do parquet salvo como texto
+        ano = int(r["_ano"]) if pd.notna(r["_ano"]) else None
+        mes = int(r["_mes"]) if pd.notna(r["_mes"]) else None
+        if ano and mes:
+            return f"{mes:02d}/{ano}"
+        if ano:
+            return f"{ano}"
+        return "s/ data"
 
     linhas = []
     for _, r in d.iterrows():
-        ano = int(r["_ano"]) if pd.notna(r["_ano"]) else "s/ data"
+        comp = _competencia(r)
+        rua = r.get("Rua", "")
+        rua = rua if (isinstance(rua, str) and rua and rua.lower() != "nan") else ""
+        num = r.get("Numero", "")
+        num = num if (isinstance(num, str) and num and num.lower() != "nan"
+                      and num not in ("0", "0.0")) else ""
+        # monta "Rua, Número" conforme o que houver
+        if rua and num:
+            endereco = f"{rua}, {num}"
+        elif rua:
+            endereco = rua
+        else:
+            endereco = "s/ endereço"
         linhas.append(
-            f"<li style='margin-bottom:4px'>"
-            f"<b>{ano}</b> · {r.get('Fase','—')} · {r.get('Segmento','—')}<br>"
+            f"<li style='margin-bottom:5px'>"
+            f"<b>{endereco}</b><br>"
+            f"{comp} · {r.get('Fase','—')} · {r.get('Segmento','—')}<br>"
             f"<span style='color:#555'>SQL {r.get('SQL','—')} · "
             f"Proc. {r.get('Processo Aprova Digital','—')}</span></li>"
         )
     return (
         f"<div style='font-size:13px'>"
         f"<b>Quarteirão {quadra} — {familia}</b> ({len(d)})"
-        f"<ul style='max-height:180px;overflow-y:auto;padding-left:16px;"
+        f"<ul style='max-height:200px;overflow-y:auto;padding-left:16px;"
         f"margin:6px 0 0 0'>" + "".join(linhas) + "</ul></div>"
     )
 
