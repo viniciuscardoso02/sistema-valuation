@@ -14,6 +14,7 @@ nunca derrubam o app.
 import os
 import glob
 import random
+import re
 import unicodedata
 from datetime import date
 
