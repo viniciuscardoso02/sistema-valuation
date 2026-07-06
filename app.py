@@ -256,6 +256,31 @@ def carregar_geojson_quadras(caminho):
 QUADRAS_GEO = carregar_geojson_quadras(GEOJSON_QUADRAS)
 
 
+# --- Base de alvarás (Aprova Digital), indexada por SQL ---
+ALVARAS_PATH = os.path.join(APP_DIR, "alvaras_final.parquet")
+if not os.path.exists(ALVARAS_PATH):
+    ALVARAS_PATH = "alvaras_final.parquet"
+
+
+@st.cache_data(show_spinner=False)
+def carregar_alvaras(caminho):
+    """Carrega a base de alvarás (uma linha por SQL×alvará) e devolve dois objetos:
+    (1) o DataFrame completo, e (2) um dict {SQL: DataFrame dos alvarás daquele SQL}
+    para consulta rápida no relatório do imóvel. Retorna (None, {}) se faltar."""
+    try:
+        df = pd.read_parquet(caminho)
+        df["SQL"] = df["SQL"].astype(str)
+        # ano como número (para ordenar); mantém 'nan' como faltante
+        df["Ano_Alvara_num"] = pd.to_numeric(df["Ano_Alvara"], errors="coerce")
+        por_sql = {sql: grupo for sql, grupo in df.groupby("SQL")}
+        return df, por_sql
+    except Exception:
+        return None, {}
+
+
+ALVARAS_DF, ALVARAS_POR_SQL = carregar_alvaras(ALVARAS_PATH)
+
+
 # --- Zoneamento (LPUOS 2016) buscado sob demanda por área, direto do GeoSampa ---
 WFS_GEOSAMPA = "http://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
 CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
@@ -1121,6 +1146,52 @@ if rua or distrito_alvo != "Selecione...":
             st.caption(f"Busca aberta em {distrito_alvo} ({filtro_txt}). Os portais "
                        "atualizam suas URLs periodicamente; se um filtro não vier "
                        "aplicado, refine na própria página do portal.")
+
+        # ---- HISTÓRICO DE ALVARÁS (Aprova Digital) ----
+        if ALVARAS_DF is not None and COL_SQL in df.columns:
+            # normaliza o SQL dos imóveis do recorte para 11 dígitos
+            def _sql11(v):
+                d = re.sub(r"\D", "", str(v))
+                if len(d) > 11:
+                    return d[:11]        # trunca extras
+                return d.zfill(11)       # completa à esquerda
+            sql_norm = df[COL_SQL].astype(str).apply(_sql11)
+            sqls_recorte = set(sql_norm) & set(ALVARAS_POR_SQL.keys())
+
+            if sqls_recorte:
+                # junta todos os alvarás dos imóveis do recorte
+                alv = ALVARAS_DF[ALVARAS_DF["SQL"].isin(sqls_recorte)].copy()
+                # conta alvarás ÚNICOS (um alvará pode cobrir vários lotes)
+                n_processos = alv["Processo Aprova Digital"].nunique()
+                n_imoveis_com = len(sqls_recorte)
+                n_reformas = alv[alv["Familia"] == "Reforma"]["Processo Aprova Digital"].nunique()
+                n_novas = alv[alv["Familia"] == "Edificação Nova"]["Processo Aprova Digital"].nunique()
+                n_demol = alv[alv["Familia"] == "Demolição"]["Processo Aprova Digital"].nunique()
+
+                st.markdown("### 🏗️ Alvarás de obra na região (Aprova Digital)")
+                ca1, ca2, ca3, ca4 = st.columns(4)
+                ca1.metric("Imóveis com alvará", n_imoveis_com)
+                ca2.metric("Reformas", n_reformas)
+                ca3.metric("Construções novas", n_novas)
+                ca4.metric("Demolições", n_demol)
+
+                # lista os imóveis reformados (mais relevante para retrofit)
+                reformados = alv[alv["Familia"] == "Reforma"].copy()
+                if not reformados.empty:
+                    reformados["_ano"] = pd.to_numeric(reformados["Ano_Alvara"], errors="coerce")
+                    reformados = reformados.sort_values("_ano", ascending=False)
+                    with st.expander(f"🔧 Ver {n_reformas} imóvel(is) com alvará de REFORMA"):
+                        for _, r in reformados.drop_duplicates("Processo Aprova Digital").iterrows():
+                            ano = int(r["_ano"]) if pd.notna(r["_ano"]) else "s/ data"
+                            st.write(f"• **SQL {r['SQL']}** · {ano} · {r['Fase']} · {r['Segmento']}")
+
+                st.caption("Fonte: alvarás do Aprova Digital (PMSP), 2021–2026, cruzados por SQL. "
+                           "Um alvará pode cobrir vários lotes; a contagem é de processos únicos. "
+                           "Alvará de reforma é sinal forte de retrofit.")
+            else:
+                st.markdown("### 🏗️ Alvarás de obra na região (Aprova Digital)")
+                st.caption("Nenhum alvará de obra (2021–2026) encontrado para os imóveis "
+                           "deste recorte.")
 
         # ---- INDICADORES DE MERCADO (sempre por MÉDIA) ----
         st.markdown("### 📊 Indicadores de mercado (R$/m²)")
