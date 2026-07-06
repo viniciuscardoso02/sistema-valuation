@@ -506,6 +506,36 @@ def alvaras_por_quadra(alvaras_df, familia="Reforma", quadras_visiveis=None):
     return resultado
 
 
+def _html_popup_alvaras(quadra, familia, grupo):
+    """Monta o HTML do popup listando os alvarás de uma família num quarteirão.
+    Recebe 'grupo' já filtrado (quadra+família) para não refiltrar a base a cada
+    círculo. Uma linha por processo único, Ano · Fase · Segmento · SQL · Nº,
+    ordenado do mais recente para o mais antigo, com rolagem se for longo."""
+    d = grupo
+    if d.empty:
+        return f"<b>Quarteirão {quadra} — {familia}</b><br>Sem alvarás."
+    if "Processo Aprova Digital" in d.columns:
+        d = d.drop_duplicates("Processo Aprova Digital")
+    d = d.assign(_ano=pd.to_numeric(d["Ano_Alvara"], errors="coerce"))
+    d = d.sort_values("_ano", ascending=False, na_position="last")
+
+    linhas = []
+    for _, r in d.iterrows():
+        ano = int(r["_ano"]) if pd.notna(r["_ano"]) else "s/ data"
+        linhas.append(
+            f"<li style='margin-bottom:4px'>"
+            f"<b>{ano}</b> · {r.get('Fase','—')} · {r.get('Segmento','—')}<br>"
+            f"<span style='color:#555'>SQL {r.get('SQL','—')} · "
+            f"Proc. {r.get('Processo Aprova Digital','—')}</span></li>"
+        )
+    return (
+        f"<div style='font-size:13px'>"
+        f"<b>Quarteirão {quadra} — {familia}</b> ({len(d)})"
+        f"<ul style='max-height:180px;overflow-y:auto;padding-left:16px;"
+        f"margin:6px 0 0 0'>" + "".join(linhas) + "</ul></div>"
+    )
+
+
 # --- Links de busca em portais de imóveis (distrito + tipo + faixa de preço) ---
 # Zona oficial de cada distrito (fonte: GeoSampa, campo nm_regiao_05).
 DISTRITO_ZONA = {
@@ -1616,6 +1646,18 @@ if rua or distrito_alvo != "Selecione...":
                             for cod, n in cont.items():
                                 por_quadra.setdefault(cod, []).append((fam, n))
 
+                        # pré-computa os popups (uma passada na base, não uma por círculo).
+                        # filtra a base só às quadras/famílias que serão desenhadas.
+                        quadras_desenhar = set(por_quadra.keys())
+                        base_pop = ALVARAS_DF[
+                            ALVARAS_DF["Familia"].isin(alvara_familias)
+                        ].copy()
+                        base_pop["_quadra"] = base_pop["SQL"].astype(str).str[:6]
+                        base_pop = base_pop[base_pop["_quadra"].isin(quadras_desenhar)]
+                        popups = {}   # (quadra, familia) -> html
+                        for (qd, fm), grp in base_pop.groupby(["_quadra", "Familia"]):
+                            popups[(qd, fm)] = _html_popup_alvaras(qd, fm, grp)
+
                         desenhados = set()
                         for cod, itens in por_quadra.items():
                             geom = QUADRAS_GEO.get(cod)
@@ -1633,8 +1675,9 @@ if rua or distrito_alvo != "Selecione...":
                                     color=cor, weight=1,
                                     fill=True, fill_color=cor, fill_opacity=0.45,
                                     popup=folium.Popup(
-                                        f"<b>Quarteirão:</b> {cod}<br>"
-                                        f"<b>{fam}:</b> {n} alvará(s)", max_width=200),
+                                        popups.get((cod, fam),
+                                                   f"<b>Quarteirão {cod} — {fam}</b>"),
+                                        max_width=280),
                                     tooltip=f"{n} × {fam}",
                                 ).add_to(m)
                             desenhados.add(cod)
