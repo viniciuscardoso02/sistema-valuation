@@ -801,14 +801,16 @@ mostrar_modernizacao = st.sidebar.checkbox(
 )
 mostrar_alvaras = st.sidebar.checkbox(
     "Alvarás de obra — círculo no quarteirão", value=False,
-    help="Marca cada quarteirão com um círculo cujo tamanho reflete a quantidade "
-         "de alvarás de obra (Aprova Digital). Independe do filtro de status.",
+    help="Marca cada quarteirão com círculos por família de alvará (Aprova Digital). "
+         "Reforma = verde, Edificação Nova = roxo, Demolição = magenta. "
+         "O tamanho reflete a quantidade. Independe do filtro de status.",
 )
-alvara_familia = st.sidebar.selectbox(
-    "↳ Tipo de alvará a mostrar",
-    ["Reforma", "Edificação Nova", "Demolição", "Todos"],
-    index=0,
-    help="Reforma é o sinal mais forte de retrofit. 'Todos' soma as três famílias.",
+alvara_familias = st.sidebar.multiselect(
+    "↳ Famílias a mostrar",
+    ["Reforma", "Edificação Nova", "Demolição"],
+    default=["Reforma", "Edificação Nova", "Demolição"],
+    help="As três aparecem ao mesmo tempo, cada uma com sua cor. "
+         "Desmarque alguma para ocultá-la.",
     disabled=not mostrar_alvaras,
 )
 
@@ -1557,31 +1559,38 @@ if rua or distrito_alvo != "Selecione...":
                     if partes_cap:
                         st.caption("🧱 Camadas por quarteirão — " + " · ".join(partes_cap) + ".")
 
-            # --- Camada de alvarás por quarteirão (círculos) ---
+            # --- Camada de alvarás por quarteirão (círculos por família) ---
             if mostrar_alvaras:
                 if ALVARAS_DF is None:
                     st.caption("ℹ️ Base de alvarás (alvaras_final.parquet) não encontrada "
                                "no repositório.")
                 elif not QUADRAS_GEO:
                     st.caption("ℹ️ Arquivo de polígonos das quadras não encontrado.")
+                elif not alvara_familias:
+                    st.caption("ℹ️ Selecione ao menos uma família de alvará para exibir.")
                 else:
-                    # limita às quadras visíveis no recorte (as que têm transações)
+                    # cores por família (reforma verde, nova roxo, demolição magenta)
+                    CORES_FAM = {"Reforma": "#238b45",
+                                 "Edificação Nova": "#6a51a3",
+                                 "Demolição": "#c51b8a"}
+
+                    # quadras visíveis no recorte
                     quadras_visiveis = set(df_geo["Quadra"].dropna().astype(str)) \
                         if "Quadra" in df_geo.columns else None
-                    contagem_alv = alvaras_por_quadra(
-                        ALVARAS_DF, familia=alvara_familia,
-                        quadras_visiveis=quadras_visiveis)
 
-                    if not contagem_alv:
-                        st.caption(f"ℹ️ Nenhum alvará de '{alvara_familia}' encontrado nos "
+                    # conta cada família selecionada por quadra
+                    contagens = {}   # familia -> {quadra: n}
+                    for fam in alvara_familias:
+                        contagens[fam] = alvaras_por_quadra(
+                            ALVARAS_DF, familia=fam, quadras_visiveis=quadras_visiveis)
+
+                    # vmax global (comparabilidade de tamanho entre famílias)
+                    todos_vals = [n for c in contagens.values() for n in c.values()]
+                    if not todos_vals:
+                        st.caption("ℹ️ Nenhum alvará das famílias selecionadas nos "
                                    "quarteirões deste recorte.")
                     else:
-                        import statistics
-                        cores_fam = {"Reforma": "#e6550d", "Edificação Nova": "#3182bd",
-                                     "Demolição": "#756bb1", "Todos": "#31a354"}
-                        cor_circ = cores_fam.get(alvara_familia, "#e6550d")
-                        vals = list(contagem_alv.values())
-                        vmax = max(vals)
+                        vmax = max(todos_vals)
 
                         def _centroide(geom):
                             """Centroide simples (média dos vértices) de Polygon/MultiPolygon."""
@@ -1601,31 +1610,47 @@ if rua or distrito_alvo != "Selecione...":
                             except Exception:
                                 return None
 
-                        desenhados = 0
-                        for cod, n in contagem_alv.items():
+                        # reúne, por quadra, a lista de (familia, n) a desenhar
+                        por_quadra = {}   # quadra -> [(familia, n), ...]
+                        for fam, cont in contagens.items():
+                            for cod, n in cont.items():
+                                por_quadra.setdefault(cod, []).append((fam, n))
+
+                        desenhados = set()
+                        for cod, itens in por_quadra.items():
                             geom = QUADRAS_GEO.get(cod)
                             if geom is None:
                                 continue
                             centro = _centroide(geom)
                             if centro is None:
                                 continue
-                            # raio entre 4 e 18 px, proporcional à contagem
-                            raio = 4 + 14 * (n / vmax if vmax else 0)
-                            folium.CircleMarker(
-                                location=centro, radius=raio,
-                                color=cor_circ, weight=1,
-                                fill=True, fill_color=cor_circ, fill_opacity=0.55,
-                                popup=folium.Popup(
-                                    f"<b>Quarteirão:</b> {cod}<br>"
-                                    f"<b>{alvara_familia}:</b> {n} alvará(s)", max_width=200),
-                                tooltip=f"{n} × {alvara_familia}",
-                            ).add_to(m)
-                            desenhados += 1
+                            # desenha do MAIOR para o menor, para o menor ficar visível por cima
+                            for fam, n in sorted(itens, key=lambda x: x[1], reverse=True):
+                                cor = CORES_FAM.get(fam, "#238b45")
+                                raio = 4 + 14 * (n / vmax if vmax else 0)
+                                folium.CircleMarker(
+                                    location=centro, radius=raio,
+                                    color=cor, weight=1,
+                                    fill=True, fill_color=cor, fill_opacity=0.45,
+                                    popup=folium.Popup(
+                                        f"<b>Quarteirão:</b> {cod}<br>"
+                                        f"<b>{fam}:</b> {n} alvará(s)", max_width=200),
+                                    tooltip=f"{n} × {fam}",
+                                ).add_to(m)
+                            desenhados.add(cod)
 
-                        total_alv = sum(vals)
-                        st.caption(f"🏗️ **Alvarás por quarteirão ({alvara_familia})**: círculo "
-                                   f"maior = mais alvarás. {desenhados} quarteirões · {total_alv} "
-                                   f"alvarás no total. Independe do filtro de status.")
+                        # legenda com totais por família
+                        partes = []
+                        nomes_cor = {"Reforma": "verde", "Edificação Nova": "roxo",
+                                     "Demolição": "magenta"}
+                        for fam in alvara_familias:
+                            tot = sum(contagens[fam].values())
+                            if tot:
+                                partes.append(f"{fam} ({nomes_cor.get(fam,'')}): {tot}")
+                        st.caption(f"🏗️ **Alvarás por quarteirão** — círculo maior = mais "
+                                   f"alvarás · {len(desenhados)} quarteirões · "
+                                   + " · ".join(partes)
+                                   + ". Independe do filtro de status.")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
