@@ -203,6 +203,25 @@ def carregar_lista_distritos(glob_path):
 distritos_disp = carregar_lista_distritos(PARQUET_GLOB)
 
 
+@st.cache_data(show_spinner=False)
+def carregar_lista_zonas(glob_path):
+    """Lista as zonas (LPUOS) presentes na base, para o filtro de exclusão.
+    Retorna [] se a coluna Zona ainda não existir na base."""
+    if "Zona" not in get_available_columns(glob_path):
+        return []
+    try:
+        q = ('SELECT DISTINCT "Zona" AS z '
+             f"FROM read_parquet('{glob_path}', union_by_name=true) "
+             'WHERE "Zona" IS NOT NULL')
+        df_z = duckdb.query(q).df()
+        return sorted(df_z["z"].astype(str).unique())
+    except Exception:
+        return []
+
+
+zonas_disp = carregar_lista_zonas(PARQUET_GLOB)
+
+
 # Caminho do GeoJSON de distritos (para desenhar o contorno no mapa)
 GEOJSON_DISTRITOS = os.path.join(APP_DIR, "distritos_sp.geojson")
 if not os.path.exists(GEOJSON_DISTRITOS):
@@ -878,6 +897,17 @@ mostrar_zoneamento = st.sidebar.toggle(
           "do distrito. As zonas são buscadas na hora do GeoSampa, só para a "
           "área visível."),
 )
+zonas_excluidas = st.sidebar.multiselect(
+    "Excluir zonas do cálculo",
+    zonas_disp,
+    default=[],
+    help=("Remove imóveis dessas zonas de TODO o relatório (média de preço, "
+          "faixa de valor, mapa). Útil para tirar zonas comerciais que distorcem "
+          "a média residencial — ex.: ZCOR-1 nas avenidas do Alto de Pinheiros."),
+    disabled=(not zonas_disp),
+)
+if zonas_excluidas:
+    st.sidebar.caption(f"↳ Excluindo: {', '.join(zonas_excluidas)}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("📍 Pontos de Interesse")
@@ -1084,6 +1114,19 @@ if rua or distrito_alvo != "Selecione...":
         if df.empty:
             st.warning("Nenhuma transação dentro do período selecionado.")
             st.stop()
+
+        # 8.4a exclusão de zonas (afeta todo o relatório: média, faixa, mapa)
+        if zonas_excluidas and "Zona" in df.columns:
+            antes = len(df)
+            df = df[~df["Zona"].isin(zonas_excluidas)]
+            removidas = antes - len(df)
+            if removidas > 0:
+                st.info(f"🗺️ {removidas} transação(ões) de {', '.join(zonas_excluidas)} "
+                        f"excluída(s) do cálculo.")
+            if df.empty:
+                st.warning("Todas as transações do recorte estão nas zonas excluídas. "
+                           "Remova alguma zona da exclusão para ver resultados.")
+                st.stop()
 
         # 8.4b filtro por área (alvo ± margem de 20%) — construída e/ou terreno
         if area_constr_alvo > 0:
