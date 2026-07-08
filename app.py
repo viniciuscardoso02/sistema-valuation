@@ -16,6 +16,7 @@ import glob
 import random
 import re
 import unicodedata
+import requests
 from datetime import date
 
 import streamlit as st
@@ -23,7 +24,6 @@ import pandas as pd
 import numpy as np
 import duckdb
 import folium
-from geopy.geocoders import Nominatim
 import altair as alt
 
 # --- Renderizador de mapa compatível com versões nova e antiga do streamlit-folium ---
@@ -181,6 +181,64 @@ def get_coord(df, name, parsed_name):
         s = df[name].astype(str).str.strip().str.replace(",", ".", regex=False)
         return pd.to_numeric(s, errors="coerce")
     return pd.Series(np.nan, index=df.index, dtype="float64")
+
+
+def geocodificar_endereco(rua, num, glob_path):
+    """Acha as coordenadas de um endereço em 2 etapas:
+    (1) na PRÓPRIA base — casa a rua (e o número, se houver) e usa a mediana das
+        coordenadas dos imóveis correspondentes; rápido, grátis, robusto.
+    (2) se a base não tiver, recorre ao LocationIQ (chave em st.secrets).
+    Retorna (lat, lon, fonte, rotulo) ou (None, None, None, None) se falhar.
+    'fonte' é 'base' ou 'locationiq'; 'rotulo' é o texto do endereço encontrado."""
+    lat_e = coord_sql("Latitude")
+    lon_e = coord_sql("Longitude")
+
+    # --- Etapa 1: buscar na própria base ---
+    try:
+        palavras = extrair_palavras_chave_rua(rua)
+        if palavras:
+            cond_rua = " AND ".join(
+                [f"UPPER(\"{COL_LOGR}\") LIKE '%{sql_str(p)}%'" for p in palavras]
+            )
+            # se número informado, tenta casar o número exato primeiro
+            for cond_num in ([f"AND TRY_CAST(REGEXP_REPLACE(CAST(\"{COL_NUM}\" AS VARCHAR),"
+                              f"'[^0-9]','','g') AS INTEGER) = {int(re.sub(r'[^0-9]','', str(num)))}"]
+                             if num and re.sub(r'[^0-9]', '', str(num)) else [""]) + [""]:
+                q = f"""
+                SELECT MEDIAN({lat_e}) AS lat, MEDIAN({lon_e}) AS lon, COUNT(*) AS n
+                FROM read_parquet('{glob_path}', union_by_name=true)
+                WHERE ({cond_rua}) {cond_num}
+                  AND {lat_e} IS NOT NULL AND {lon_e} IS NOT NULL
+                """
+                r = duckdb.query(q).df()
+                if not r.empty and r["n"].iloc[0] > 0 and pd.notna(r["lat"].iloc[0]):
+                    rotulo = f"{rua}" + (f", {num}" if num and cond_num else "")
+                    return (float(r["lat"].iloc[0]), float(r["lon"].iloc[0]),
+                            "base", rotulo)
+    except Exception:
+        pass
+
+    # --- Etapa 2: LocationIQ (fallback) ---
+    try:
+        chave = st.secrets.get("LOCATIONIQ_KEY", None)
+        if chave:
+            endereco = f"{rua}, {num}, São Paulo, SP, Brasil" if num \
+                else f"{rua}, São Paulo, SP, Brasil"
+            resp = requests.get(
+                "https://us1.locationiq.com/v1/search",
+                params={"key": chave, "q": endereco, "format": "json", "limit": 1,
+                        "countrycodes": "br"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                dados = resp.json()
+                if dados:
+                    return (float(dados[0]["lat"]), float(dados[0]["lon"]),
+                            "locationiq", dados[0].get("display_name", endereco).split(",")[0])
+    except Exception:
+        pass
+
+    return (None, None, None, None)
 
 
 # ============================================================================
@@ -953,22 +1011,22 @@ if rua or distrito_alvo != "Selecione...":
 
         try:
             if rua:
-                # 7.1 tenta geocodificar (com user_agent randômico para mitigar 429)
-                loc = None
+                # 7.1 geocodifica: primeiro na própria base, depois LocationIQ
+                lat_c = lon_c = None
+                fonte_geo = rotulo_geo = None
                 try:
-                    rand_id = random.randint(10000, 99999)
-                    geolocator = Nominatim(user_agent=f"h2i_valuation_engine_{rand_id}")
-                    endereco = f"{rua}, {num}, São Paulo, SP" if num else f"{rua}, São Paulo, SP"
-                    loc = geolocator.geocode(endereco, timeout=8)
+                    lat_c, lon_c, fonte_geo, rotulo_geo = geocodificar_endereco(
+                        rua, num, PARQUET_GLOB)
                 except Exception:
-                    loc = None
+                    lat_c = lon_c = None
 
                 tem_geo = has("Latitude") and has("Longitude")
 
                 # 7.2 busca por raio (geocodificou E base tem coordenadas)
-                if loc and tem_geo:
-                    lat_c, lon_c = loc.latitude, loc.longitude
-                    st.success(f"📍 Endereço Alvo Localizado: **{loc.address.split(',')[0]}**")
+                if lat_c is not None and lon_c is not None and tem_geo:
+                    origem = "base de transações" if fonte_geo == "base" else "LocationIQ"
+                    st.success(f"📍 Endereço Alvo Localizado: **{rotulo_geo}** "
+                               f"_(via {origem})_")
 
                     lat_e = coord_sql("Latitude")
                     lon_e = coord_sql("Longitude")
@@ -1045,10 +1103,10 @@ if rua or distrito_alvo != "Selecione...":
                 if df_bruto.empty and has(COL_LOGR):
                     palavras = extrair_palavras_chave_rua(rua)
                     if palavras:
-                        if not loc:
-                            st.warning("⚠️ Modo de contingência ativado: serviço de mapas "
-                                       "indisponível no servidor compartilhado. Puxando "
-                                       "histórico textual da rua.")
+                        if lat_c is None or lon_c is None:
+                            st.warning("⚠️ Não foi possível localizar as coordenadas exatas "
+                                       "deste endereço (nem na base, nem no geocodificador). "
+                                       "Exibindo o histórico textual da rua.")
                         else:
                             st.info("ℹ️ Nenhum imóvel dentro do raio; exibindo histórico "
                                     "textual do logradouro.")
