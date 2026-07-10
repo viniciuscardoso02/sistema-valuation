@@ -359,6 +359,105 @@ def carregar_alvaras(caminho):
 ALVARAS_DF, ALVARAS_POR_SQL = carregar_alvaras(ALVARAS_PATH)
 
 
+# --- Base de anúncios (Matú Imóveis), separada da base de transações ---
+ANUNCIOS_PATH = os.path.join(APP_DIR, "anuncios_matu.parquet")
+if not os.path.exists(ANUNCIOS_PATH):
+    ANUNCIOS_PATH = "anuncios_matu.parquet"
+
+# Como os anúncios seguem o MESMO filtro "Uso do Imóvel" das transações,
+# mapeamos os subtipos da imobiliária para os dois grupos do app.
+GRUPO_ANUNCIO = {
+    "Residenciais": {"Casa", "Casa de Condomínio"},
+    "Apartamentos": {"Apartamento", "Cobertura", "Duplex"},
+}
+
+# limites do município (descarta coordenadas claramente erradas)
+BBOX_SP = (-23.83, -23.36, -46.83, -46.36)   # lat_min, lat_max, lon_min, lon_max
+
+
+@st.cache_data(show_spinner=False)
+def carregar_anuncios(caminho):
+    """Carrega os anúncios (preço PEDIDO). Base independente da de transações:
+    serve para comparar oferta x fechado, nunca para entrar na média do ITBI.
+    Coordenadas vêm do CEP (precisão de logradouro). Retorna None se faltar."""
+    try:
+        df = pd.read_parquet(caminho)
+        for c in ("valor", "preco_m2_pedido", "lat", "lon", "area_construida",
+                  "area_terreno", "dorm", "banh", "suite", "vaga"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        # zera coordenadas fora do município (não desenha ponto errado)
+        if {"lat", "lon"}.issubset(df.columns):
+            dentro = (df["lat"].between(BBOX_SP[0], BBOX_SP[1]) &
+                      df["lon"].between(BBOX_SP[2], BBOX_SP[3]))
+            df.loc[~dentro, ["lat", "lon"]] = np.nan
+        return df
+    except Exception:
+        return None
+
+
+ANUNCIOS_DF = carregar_anuncios(ANUNCIOS_PATH)
+
+
+def _dist_m(lat1, lon1, lat2, lon2):
+    """Distância aproximada em metros (equirretangular; suficiente p/ raios curtos)."""
+    import math
+    x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
+    y = math.radians(lat2 - lat1)
+    return 6371000 * math.hypot(x, y)
+
+
+def _ponto_em_geom(lat, lon, geom):
+    """Ray casting: o ponto está dentro do Polygon/MultiPolygon do GeoJSON?"""
+    def _em_anel(anel):
+        dentro = False
+        n = len(anel)
+        for i in range(n):
+            x1, y1 = anel[i][0], anel[i][1]
+            x2, y2 = anel[(i + 1) % n][0], anel[(i + 1) % n][1]
+            if (y1 > lat) != (y2 > lat):
+                xin = (x2 - x1) * (lat - y1) / (y2 - y1) + x1
+                if lon < xin:
+                    dentro = not dentro
+        return dentro
+    try:
+        t = geom.get("type")
+        coords = geom.get("coordinates", [])
+        poligonos = [coords] if t == "Polygon" else (coords if t == "MultiPolygon" else [])
+        for poly in poligonos:
+            if not poly:
+                continue
+            if _em_anel(poly[0]):                       # anel externo
+                if any(_em_anel(buraco) for buraco in poly[1:]):
+                    continue                            # caiu num buraco
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def anuncios_da_regiao(anuncios, tipo, negocios, centro=None, raio_m=None, geom_dist=None):
+    """Filtra anúncios por uso (mesmo botão das transações), negócio e região.
+    Região = raio ao redor do centro OU polígono do distrito. Só anúncios com
+    coordenada entram no recorte espacial."""
+    if anuncios is None or anuncios.empty:
+        return anuncios.iloc[0:0] if anuncios is not None else None
+    d = anuncios[anuncios["subtipo"].isin(GRUPO_ANUNCIO.get(tipo, set()))]
+    if negocios:
+        d = d[d["negocio"].isin(negocios)]
+    d = d[d["lat"].notna() & d["lon"].notna()]
+    if d.empty:
+        return d
+    if geom_dist is not None:
+        mask = d.apply(lambda r: _ponto_em_geom(r["lat"], r["lon"], geom_dist), axis=1)
+        return d[mask]
+    if centro is not None and raio_m:
+        mask = d.apply(lambda r: _dist_m(centro[0], centro[1], r["lat"], r["lon"]) <= raio_m,
+                       axis=1)
+        return d[mask]
+    return d
+
+
 # --- Zoneamento (LPUOS 2016) buscado sob demanda por área, direto do GeoSampa ---
 WFS_GEOSAMPA = "http://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
 CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
@@ -948,6 +1047,28 @@ alvara_familias = st.sidebar.multiselect(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.header("📣 Anúncios (Matú Imóveis)")
+if ANUNCIOS_DF is None:
+    st.sidebar.caption("Base de anúncios não encontrada no repositório.")
+    mostrar_anuncios = False
+    anuncio_negocios = []
+else:
+    st.sidebar.caption("Preço **pedido** (oferta). Base separada das transações — "
+                       "não entra na média do ITBI. Segue o filtro *Uso do Imóvel*.")
+    mostrar_anuncios = st.sidebar.checkbox(
+        "Mostrar anúncios no mapa", value=False,
+        help="Marca cada anúncio com um pino. Venda = preto, Aluguel = azul-petróleo. "
+             "A localização vem do CEP (precisão de logradouro).",
+    )
+    anuncio_negocios = st.sidebar.multiselect(
+        "↳ Negócio",
+        ["Venda", "Aluguel"],
+        default=["Venda"],
+        help="Venda e aluguel aparecem com cores diferentes.",
+        disabled=not mostrar_anuncios,
+    )
+
+st.sidebar.markdown("---")
 st.sidebar.header("🗺️ Zoneamento")
 mostrar_zoneamento = st.sidebar.toggle(
     "Mostrar zoneamento (LPUOS 2016)", value=False,
@@ -1393,6 +1514,64 @@ if rua or distrito_alvo != "Selecione...":
                 st.caption("Nenhum alvará de obra (2021–2026) encontrado para os imóveis "
                            "deste recorte.")
 
+        # ---- ANÚNCIOS (PREÇO PEDIDO) E SPREAD CONTRA O TRANSACIONADO ----
+        if ANUNCIOS_DF is not None:
+            _modo_dist = (not rua) and (distrito_alvo != "Selecione...")
+            _feat = DISTRITOS_GEO.get(str(distrito_alvo)) \
+                if (_modo_dist and DISTRITOS_GEO is not None) else None
+            _geom = _feat.get("geometry") if _feat else None
+            _centro = [lat_c, lon_c] if (lat_c and lon_c) else None
+
+            an = anuncios_da_regiao(
+                ANUNCIOS_DF, tipo, ["Venda", "Aluguel"],
+                centro=(None if _modo_dist else _centro),
+                raio_m=(None if _modo_dist else raio),
+                geom_dist=_geom,
+            )
+
+            st.markdown("### 📣 Anúncios na região (preço pedido)")
+            if an is None or an.empty:
+                st.caption("Nenhum anúncio da base (Matú Imóveis) nesta região "
+                           "para o uso selecionado.")
+            else:
+                venda = an[(an["negocio"] == "Venda") & an["preco_m2_pedido"].notna()]
+                med_ped = venda["preco_m2_pedido"].median() if not venda.empty else None
+                med_tra = df["Preco_m2"].median() if "Preco_m2" in df.columns else None
+
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("Anúncios (venda)", f"{int((an['negocio']=='Venda').sum())}")
+                a2.metric("Mediana R$/m² pedido",
+                          formata_moeda(med_ped) if med_ped else "—")
+                a3.metric("Mediana R$/m² transacionado",
+                          formata_moeda(med_tra) if med_tra else "—")
+                if med_ped and med_tra and med_tra > 0:
+                    spread = (med_ped / med_tra - 1) * 100
+                    a4.metric("Spread pedido × transacionado", f"{spread:+.0f}%")
+                else:
+                    a4.metric("Spread pedido × transacionado", "—")
+
+                with st.expander(f"Ver {len(an)} anúncio(s) desta região"):
+                    _v = an.sort_values("preco_m2_pedido", ascending=False, na_position="last")
+                    for _, a in _v.iterrows():
+                        num = a.get("numero")
+                        num_txt = ""
+                        if pd.notna(num) and str(num) not in ("", "nan"):
+                            flag = "" if a.get("numero_confiavel") in (True, "True") else "?"
+                            num_txt = f", {int(float(num))}{flag}"
+                        pm2 = a.get("preco_m2_pedido")
+                        pm2_txt = f" · {formata_moeda(pm2)}/m²" if pd.notna(pm2) else ""
+                        st.write(f"• **{a.get('logradouro','s/ endereço')}{num_txt}** "
+                                 f"({a.get('subtipo','—')}, {a.get('negocio','')}) — "
+                                 f"{formata_moeda(a.get('valor'))}{pm2_txt}")
+
+                st.caption(
+                    "Fonte: lista da Matú Imóveis, extraída em 10/07/2026. **Preço pedido**, "
+                    "não fechado. O ITBI registra o **valor declarado**, normalmente abaixo do "
+                    "preço real; o anúncio é o teto pretendido. Assim, o spread **superestima** "
+                    "o desconto real e serve para comparar regiões entre si, não como "
+                    "estimativa de desconto obtenível. Localização pelo CEP (precisão de rua)."
+                )
+
         # ---- INDICADORES DE MERCADO (sempre por MÉDIA) ----
         st.markdown("### 📊 Indicadores de mercado (R$/m²)")
         i1, i2, i3 = st.columns(3)
@@ -1821,6 +2000,57 @@ if rua or distrito_alvo != "Selecione...":
                                    f"alvarás · {len(desenhados)} quarteirões · "
                                    + " · ".join(partes)
                                    + ". Independe do filtro de status.")
+
+            # --- Camada de anúncios (preço pedido), base separada ---
+            anuncios_regiao = None
+            if mostrar_anuncios and ANUNCIOS_DF is not None:
+                geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
+                anuncios_regiao = anuncios_da_regiao(
+                    ANUNCIOS_DF, tipo, anuncio_negocios,
+                    centro=(None if modo_distrito else centro),
+                    raio_m=(None if modo_distrito else raio),
+                    geom_dist=geom_d,
+                )
+                if anuncios_regiao is None or anuncios_regiao.empty:
+                    st.caption("ℹ️ Nenhum anúncio da Matú nesta região com os filtros atuais.")
+                else:
+                    CORES_NEG = {"Venda": "black", "Aluguel": "cadetblue"}
+                    for _, a in anuncios_regiao.iterrows():
+                        pm2 = a.get("preco_m2_pedido")
+                        pm2_txt = formata_moeda(pm2) if pd.notna(pm2) else "—"
+                        num = a.get("numero")
+                        num_txt = ""
+                        if pd.notna(num) and str(num) not in ("", "nan"):
+                            flag = "" if a.get("numero_confiavel") in (True, "True") else "?"
+                            num_txt = f", {int(float(num))}{flag}"
+                        quartos = " · ".join(
+                            f"{int(a[c])} {n}" for c, n in
+                            (("dorm", "dorm"), ("banh", "banh"), ("suite", "suíte"), ("vaga", "vaga"))
+                            if pd.notna(a.get(c))
+                        )
+                        html = (
+                            f"<div style='font-size:13px'>"
+                            f"<b>{a.get('logradouro','s/ endereço')}{num_txt}</b><br>"
+                            f"{a.get('subtipo','—')} · <b>{a.get('negocio','')}</b><br>"
+                            f"{formata_moeda(a.get('valor'))}"
+                            + (f" · <b>{pm2_txt}/m²</b>" if a.get("negocio") == "Venda" else "")
+                            + f"<br><span style='color:#555'>{quartos}</span><br>"
+                            f"<span style='color:#555'>constr. {a.get('area_construida','—')} m² · "
+                            f"terreno {a.get('area_terreno','—')} m²</span></div>"
+                        )
+                        folium.Marker(
+                            location=[a["lat"], a["lon"]],
+                            icon=folium.Icon(color=CORES_NEG.get(a["negocio"], "gray"),
+                                             icon="home", prefix="fa"),
+                            popup=folium.Popup(html, max_width=250),
+                            tooltip=f"{a.get('negocio')} · {pm2_txt}/m²",
+                        ).add_to(m)
+                    n_v = int((anuncios_regiao["negocio"] == "Venda").sum())
+                    n_a = int((anuncios_regiao["negocio"] == "Aluguel").sum())
+                    st.caption(f"📣 **Anúncios (Matú)** — {len(anuncios_regiao)} nesta região "
+                               f"({n_v} venda, {n_a} aluguel). Pino preto = venda, "
+                               f"azul-petróleo = aluguel. Preço **pedido**; posição pelo CEP "
+                               f"(precisão de rua). Nº com “?” é de baixa confiança.")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
