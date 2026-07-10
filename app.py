@@ -27,38 +27,26 @@ import folium
 import altair as alt
 
 # --- Renderizador de mapa compatível com versões nova e antiga do streamlit-folium ---
-# Quando capturar_desenho=True, devolve o que o usuário desenhou no mapa (polígono),
-# para permitir recortar as transações por uma área desenhada à mão.
 try:
     from streamlit_folium import st_folium
 
-    def render_map(m, capturar_desenho=False):
-        retorno = None if not capturar_desenho else ["all_drawings"]
+    def render_map(m):
         try:
-            return st_folium(m, height=480, use_container_width=True,
-                             returned_objects=(retorno or []))
+            st_folium(m, height=480, use_container_width=True, returned_objects=[])
         except TypeError:  # versões antigas sem use_container_width
-            return st_folium(m, width=1100, height=480,
-                             returned_objects=(retorno or []))
+            st_folium(m, width=1100, height=480, returned_objects=[])
 
 except Exception:
     from streamlit_folium import folium_static
 
-    def render_map(m, capturar_desenho=False):
+    def render_map(m):
         folium_static(m, width=1100, height=480)
-        return None
 
 try:
     from folium.plugins import MarkerCluster
     HAS_CLUSTER = True
 except Exception:
     HAS_CLUSTER = False
-
-try:
-    from folium.plugins import Draw
-    HAS_DRAW = True
-except Exception:
-    HAS_DRAW = False
 
 try:
     from folium.plugins import HeatMap
@@ -1081,23 +1069,6 @@ else:
     )
 
 st.sidebar.markdown("---")
-st.sidebar.header("✏️ Área desenhada")
-if not HAS_DRAW:
-    st.sidebar.caption("Ferramenta de desenho indisponível nesta versão do folium.")
-    modo_desenho = False
-else:
-    modo_desenho = st.sidebar.checkbox(
-        "Recortar por área desenhada no mapa", value=False,
-        help="Ative para desenhar um polígono ou retângulo direto no mapa. As "
-             "transações e os indicadores passam a considerar só o que estiver dentro "
-             "da área desenhada, ignorando o raio/distrito.",
-    )
-    if modo_desenho:
-        st.sidebar.caption("Use os ícones de polígono ▱ ou retângulo ▭ no canto "
-                           "superior do mapa. Ao fechar a forma, os indicadores "
-                           "recalculam para a área.")
-
-st.sidebar.markdown("---")
 st.sidebar.header("🗺️ Zoneamento")
 mostrar_zoneamento = st.sidebar.toggle(
     "Mostrar zoneamento (LPUOS 2016)", value=False,
@@ -1159,42 +1130,8 @@ if rua or distrito_alvo != "Selecione...":
         df_bruto = pd.DataFrame()
         lat_c, lon_c = None, None
 
-        # ÁREA DESENHADA APLICADA: recorta o relatório inteiro pelo polígono,
-        # ignorando raio/distrito. Carrega por bounding box (rápido) e filtra em pandas.
-        area_aplicada = st.session_state.get("area_aplicada")
-        usou_area = False
-
         try:
-            if area_aplicada:
-                coords = area_aplicada.get("coordinates", [[]])[0]
-                if coords:
-                    lons = [p[0] for p in coords]
-                    lats = [p[1] for p in coords]
-                    lon_min, lon_max = min(lons), max(lons)
-                    lat_min, lat_max = min(lats), max(lats)
-                    lat_e = coord_sql("Latitude")
-                    lon_e = coord_sql("Longitude")
-                    query = f"""
-                    WITH parsed AS (
-                        SELECT *, {lat_e} AS _lat, {lon_e} AS _lon
-                        FROM read_parquet('{PARQUET_GLOB}', union_by_name=true)
-                    )
-                    SELECT * FROM parsed
-                    WHERE _lat IS NOT NULL AND _lon IS NOT NULL
-                      AND _lat BETWEEN {lat_min} AND {lat_max}
-                      AND _lon BETWEEN {lon_min} AND {lon_max}
-                      {condicao_extra}
-                    """
-                    df_bbox = run_query(query)
-                    if not df_bbox.empty:
-                        dentro = df_bbox.apply(
-                            lambda r: _ponto_em_geom(r["_lat"], r["_lon"], area_aplicada),
-                            axis=1)
-                        df_bruto = df_bbox[dentro].drop(columns=["_lat", "_lon"],
-                                                        errors="ignore")
-                    usou_area = True
-
-            elif rua:
+            if rua:
                 # 7.1 geocodifica: primeiro na própria base, depois LocationIQ
                 lat_c = lon_c = None
                 fonte_geo = rotulo_geo = None
@@ -1466,18 +1403,9 @@ if rua or distrito_alvo != "Selecione...":
             min_t = max_t = media_t = np.nan
 
         # cabeçalho do relatório
-        if usou_area:
-            contexto = "Área desenhada no mapa"
-        else:
-            contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
+        contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
         st.markdown("## 📑 Relatório de Avaliação Imobiliária")
         st.markdown(f"**{contexto}**  ·  {len(df):,} transações comparáveis analisadas")
-
-        if usou_area:
-            st.info("✏️ **Este relatório está recortado pela área que você desenhou no "
-                    "mapa.** Todos os números abaixo (média, faixa, gráficos) consideram só "
-                    "as transações dentro do polígono. Para voltar ao raio/distrito, role até "
-                    "o mapa e clique em **🗑️ Limpar área**.")
 
         # ---- FAIXA DE VALOR ESTIMADA (só quando a pessoa digitou a área) ----
         faixas_estimadas = []  # cada item: (rótulo, valor_min, valor_max)
@@ -1681,15 +1609,6 @@ if rua or distrito_alvo != "Selecione...":
 
             zoom = 13 if modo_distrito else 15
             m = folium.Map(location=centro, zoom_start=zoom, tiles="CartoDB positron")
-
-            # ferramenta de desenho: só polígono e retângulo, para recortar a área
-            if modo_desenho and HAS_DRAW:
-                Draw(
-                    draw_options={"polyline": False, "circle": False,
-                                  "marker": False, "circlemarker": False,
-                                  "polygon": True, "rectangle": True},
-                    edit_options={"edit": False},
-                ).add_to(m)
 
             # modo raio: marcador alvo + círculo
             if lat_c and lon_c:
@@ -2174,85 +2093,7 @@ if rua or distrito_alvo != "Selecione...":
                                    f"({motivo}). O serviço público do OpenStreetMap costuma "
                                    f"oscilar — tente novamente em alguns segundos.")
 
-            if modo_desenho and HAS_DRAW:
-                saida_mapa = render_map(m, capturar_desenho=True)
-                # extrai o último polígono/retângulo desenhado
-                poligono_desenhado = None
-                if saida_mapa and saida_mapa.get("all_drawings"):
-                    desenhos = [d for d in saida_mapa["all_drawings"]
-                                if d.get("geometry", {}).get("type") == "Polygon"]
-                    if desenhos:
-                        poligono_desenhado = desenhos[-1]["geometry"]
-                st.session_state["poligono_area"] = poligono_desenhado
-
-                col_ap, col_lp = st.columns([2, 1])
-                with col_ap:
-                    if poligono_desenhado:
-                        if st.button("✅ Aplicar área ao relatório inteiro",
-                                     use_container_width=True, type="primary"):
-                            # guarda a área e recarrega: o topo do código vai usá-la
-                            st.session_state["area_aplicada"] = poligono_desenhado
-                            st.rerun()
-                    else:
-                        st.info("✏️ Desenhe um polígono ou retângulo no mapa (ícones no "
-                                "canto superior direito) para recortar a área.")
-                with col_lp:
-                    if st.session_state.get("area_aplicada"):
-                        if st.button("🗑️ Limpar área", use_container_width=True):
-                            st.session_state["area_aplicada"] = None
-                            st.rerun()
-
-                if st.session_state.get("area_aplicada"):
-                    st.success("✅ Área aplicada: o relatório inteiro (média, faixa, gráficos) "
-                               "está considerando só as transações dentro dela. Desenhe outra "
-                               "forma e clique em Aplicar para trocar, ou Limpar para voltar.")
-            else:
-                render_map(m)
-                st.session_state["poligono_area"] = None
-
-            # --- PRÉVIA da área desenhada (só antes de aplicar) ---
-            poly_area = st.session_state.get("poligono_area")
-            ja_aplicada = st.session_state.get("area_aplicada")
-            if modo_desenho and poly_area and not ja_aplicada:
-                # filtra as transações com coordenada que caem dentro do polígono
-                dg = df_geo.copy()
-                dentro = dg.apply(
-                    lambda r: _ponto_em_geom(r["Latitude"], r["Longitude"], poly_area),
-                    axis=1)
-                area_df = dg[dentro]
-                st.markdown("### ✏️ Prévia da área desenhada")
-                st.caption("Isto é só uma prévia com as transações já carregadas. Clique em "
-                           "**✅ Aplicar área** acima para recalcular o relatório inteiro "
-                           "com todas as transações da região.")
-                if area_df.empty:
-                    st.warning("Nenhuma transação dentro da área desenhada. Desenhe uma "
-                               "região maior ou em outro local.")
-                else:
-                    med = area_df["Preco_m2"].median() if "Preco_m2" in area_df else None
-                    mean = area_df["Preco_m2"].mean() if "Preco_m2" in area_df else None
-                    d1, d2, d3, d4 = st.columns(4)
-                    d1.metric("Transações na área", f"{len(area_df):,}")
-                    d2.metric("Mediana R$/m²", formata_moeda(med) if med else "—")
-                    d3.metric("Média R$/m²", formata_moeda(mean) if mean else "—")
-                    if "Modernizada" in area_df.columns:
-                        n_mod = int((area_df["Modernizada"] == True).sum()) \
-                            if area_df["Modernizada"].dtype == bool \
-                            else int(area_df["Modernizada"].astype(str).str.lower()
-                                     .isin(["true", "1", "sim"]).sum())
-                        d4.metric("Modernizados", f"{n_mod}")
-                    # anúncios (preço pedido) dentro da MESMA área desenhada
-                    if ANUNCIOS_DF is not None:
-                        an_area = anuncios_da_regiao(
-                            ANUNCIOS_DF, tipo, ["Venda"], geom_dist=poly_area)
-                        if an_area is not None and not an_area.empty:
-                            ped = an_area["preco_m2_pedido"].median()
-                            if med and ped and med > 0:
-                                spr = (ped / med - 1) * 100
-                                st.caption(f"📣 {len(an_area)} anúncio(s) de venda na área · "
-                                           f"mediana pedida {formata_moeda(ped)}/m² · "
-                                           f"spread {spr:+.0f}% sobre o transacionado.")
-                    st.caption("Recorte manual: só as transações dentro do polígono que você "
-                               "desenhou. Ignora o raio e o distrito.")
+            render_map(m)
 
             # contagem de POIs abaixo do mapa (indicador da região)
             if contagem_pois:
