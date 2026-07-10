@@ -1159,8 +1159,42 @@ if rua or distrito_alvo != "Selecione...":
         df_bruto = pd.DataFrame()
         lat_c, lon_c = None, None
 
+        # ÁREA DESENHADA APLICADA: recorta o relatório inteiro pelo polígono,
+        # ignorando raio/distrito. Carrega por bounding box (rápido) e filtra em pandas.
+        area_aplicada = st.session_state.get("area_aplicada")
+        usou_area = False
+
         try:
-            if rua:
+            if area_aplicada:
+                coords = area_aplicada.get("coordinates", [[]])[0]
+                if coords:
+                    lons = [p[0] for p in coords]
+                    lats = [p[1] for p in coords]
+                    lon_min, lon_max = min(lons), max(lons)
+                    lat_min, lat_max = min(lats), max(lats)
+                    lat_e = coord_sql("Latitude")
+                    lon_e = coord_sql("Longitude")
+                    query = f"""
+                    WITH parsed AS (
+                        SELECT *, {lat_e} AS _lat, {lon_e} AS _lon
+                        FROM read_parquet('{PARQUET_GLOB}', union_by_name=true)
+                    )
+                    SELECT * FROM parsed
+                    WHERE _lat IS NOT NULL AND _lon IS NOT NULL
+                      AND _lat BETWEEN {lat_min} AND {lat_max}
+                      AND _lon BETWEEN {lon_min} AND {lon_max}
+                      {condicao_extra}
+                    """
+                    df_bbox = run_query(query)
+                    if not df_bbox.empty:
+                        dentro = df_bbox.apply(
+                            lambda r: _ponto_em_geom(r["_lat"], r["_lon"], area_aplicada),
+                            axis=1)
+                        df_bruto = df_bbox[dentro].drop(columns=["_lat", "_lon"],
+                                                        errors="ignore")
+                    usou_area = True
+
+            elif rua:
                 # 7.1 geocodifica: primeiro na própria base, depois LocationIQ
                 lat_c = lon_c = None
                 fonte_geo = rotulo_geo = None
@@ -1432,9 +1466,18 @@ if rua or distrito_alvo != "Selecione...":
             min_t = max_t = media_t = np.nan
 
         # cabeçalho do relatório
-        contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
+        if usou_area:
+            contexto = "Área desenhada no mapa"
+        else:
+            contexto = (f"Logradouro: {rua}" if rua else f"Distrito: {distrito_alvo}")
         st.markdown("## 📑 Relatório de Avaliação Imobiliária")
         st.markdown(f"**{contexto}**  ·  {len(df):,} transações comparáveis analisadas")
+
+        if usou_area:
+            st.info("✏️ **Este relatório está recortado pela área que você desenhou no "
+                    "mapa.** Todos os números abaixo (média, faixa, gráficos) consideram só "
+                    "as transações dentro do polígono. Para voltar ao raio/distrito, role até "
+                    "o mapa e clique em **🗑️ Limpar área**.")
 
         # ---- FAIXA DE VALOR ESTIMADA (só quando a pessoa digitou a área) ----
         faixas_estimadas = []  # cada item: (rótulo, valor_min, valor_max)
@@ -2141,26 +2184,46 @@ if rua or distrito_alvo != "Selecione...":
                     if desenhos:
                         poligono_desenhado = desenhos[-1]["geometry"]
                 st.session_state["poligono_area"] = poligono_desenhado
-                if poligono_desenhado:
-                    st.success("✏️ Área desenhada capturada. Os indicadores abaixo do mapa "
-                               "consideram só as transações dentro dela.")
-                else:
-                    st.info("✏️ Modo de desenho ativo. Desenhe um polígono ou retângulo no "
-                            "mapa (ícones no canto superior direito) para recortar a área.")
+
+                col_ap, col_lp = st.columns([2, 1])
+                with col_ap:
+                    if poligono_desenhado:
+                        if st.button("✅ Aplicar área ao relatório inteiro",
+                                     use_container_width=True, type="primary"):
+                            # guarda a área e recarrega: o topo do código vai usá-la
+                            st.session_state["area_aplicada"] = poligono_desenhado
+                            st.rerun()
+                    else:
+                        st.info("✏️ Desenhe um polígono ou retângulo no mapa (ícones no "
+                                "canto superior direito) para recortar a área.")
+                with col_lp:
+                    if st.session_state.get("area_aplicada"):
+                        if st.button("🗑️ Limpar área", use_container_width=True):
+                            st.session_state["area_aplicada"] = None
+                            st.rerun()
+
+                if st.session_state.get("area_aplicada"):
+                    st.success("✅ Área aplicada: o relatório inteiro (média, faixa, gráficos) "
+                               "está considerando só as transações dentro dela. Desenhe outra "
+                               "forma e clique em Aplicar para trocar, ou Limpar para voltar.")
             else:
                 render_map(m)
                 st.session_state["poligono_area"] = None
 
-            # --- Indicadores da ÁREA DESENHADA (recorte por polígono) ---
+            # --- PRÉVIA da área desenhada (só antes de aplicar) ---
             poly_area = st.session_state.get("poligono_area")
-            if modo_desenho and poly_area:
+            ja_aplicada = st.session_state.get("area_aplicada")
+            if modo_desenho and poly_area and not ja_aplicada:
                 # filtra as transações com coordenada que caem dentro do polígono
                 dg = df_geo.copy()
                 dentro = dg.apply(
                     lambda r: _ponto_em_geom(r["Latitude"], r["Longitude"], poly_area),
                     axis=1)
                 area_df = dg[dentro]
-                st.markdown("### ✏️ Indicadores da área desenhada")
+                st.markdown("### ✏️ Prévia da área desenhada")
+                st.caption("Isto é só uma prévia com as transações já carregadas. Clique em "
+                           "**✅ Aplicar área** acima para recalcular o relatório inteiro "
+                           "com todas as transações da região.")
                 if area_df.empty:
                     st.warning("Nenhuma transação dentro da área desenhada. Desenhe uma "
                                "região maior ou em outro local.")
