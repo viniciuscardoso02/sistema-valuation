@@ -1058,6 +1058,7 @@ if ANUNCIOS_DF is None:
     st.sidebar.caption("Base de anúncios não encontrada no repositório.")
     mostrar_anuncios = False
     anuncio_negocios = []
+    anuncios_heatmap = "Desligado"
 else:
     st.sidebar.caption("Preço **pedido** (oferta). Base separada das transações — "
                        "não entra na média do ITBI. Segue o filtro *Uso do Imóvel*.")
@@ -1072,6 +1073,13 @@ else:
         default=["Venda"],
         help="Venda e aluguel aparecem com cores diferentes.",
         disabled=not mostrar_anuncios,
+    )
+    anuncios_heatmap = st.sidebar.radio(
+        "Camada de calor dos anúncios",
+        ["Desligado", "R$/m² pedido", "Densidade de anúncios"],
+        help="Sobreponível ao mapa de calor das transações. Tons de roxo/magenta "
+             "(distintos do azul→vermelho das transações), para comparar onde o "
+             "preço pedido e o transacionado se concentram. Usa anúncios de VENDA.",
     )
 
 st.sidebar.markdown("---")
@@ -1784,6 +1792,49 @@ if rua or distrito_alvo != "Selecione...":
                                    "indicam terreno mais caro na região. Apartamentos têm área "
                                    "de terreno fracionada e podem distorcer — filtre por "
                                    "'Residenciais' para uma leitura mais limpa.")
+
+            # --- Camada de calor dos ANÚNCIOS (roxo/magenta), sobreponível ---
+            if anuncios_heatmap != "Desligado" and HAS_HEATMAP and ANUNCIOS_DF is not None:
+                geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
+                an_heat = anuncios_da_regiao(
+                    ANUNCIOS_DF, tipo, ["Venda"],
+                    centro=(None if modo_distrito else centro),
+                    raio_m=(None if modo_distrito else raio),
+                    geom_dist=geom_d,
+                )
+                # gradiente roxo->magenta, distinto do azul->vermelho das transações
+                grad_anuncios = {0.0: "#3f007d", 0.5: "#807dba",
+                                 0.8: "#dd3497", 1.0: "#fa9fb5"}
+                if an_heat is None or an_heat.empty:
+                    st.caption("🟣 Sem anúncios de venda com coordenada nesta região para o "
+                               "mapa de calor.")
+                elif anuncios_heatmap == "Densidade de anúncios":
+                    pontos = an_heat[["lat", "lon"]].dropna().values.tolist()
+                    if pontos:
+                        HeatMap(pontos, radius=20, blur=24, min_opacity=0.35,
+                                gradient=grad_anuncios, name="Densidade anúncios").add_to(m)
+                        st.caption("🟣 Calor **roxo/magenta = densidade de anúncios** (onde há "
+                                   "mais imóveis à venda). Sobreponível ao calor das transações "
+                                   "(azul→vermelho) para comparar oferta × negócios fechados.")
+                elif anuncios_heatmap == "R$/m² pedido":
+                    h = an_heat.dropna(subset=["lat", "lon", "preco_m2_pedido"]).copy()
+                    h = h[h["preco_m2_pedido"] > 0]
+                    if not h.empty:
+                        lo, hi = h["preco_m2_pedido"].quantile([0.05, 0.95])
+                        if hi <= lo:
+                            lo, hi = h["preco_m2_pedido"].min(), h["preco_m2_pedido"].max()
+                        peso = ((h["preco_m2_pedido"].clip(lo, hi) - lo) / (hi - lo)) \
+                            if hi > lo else 1.0
+                        h = h.assign(_peso=peso)
+                        pontos = h[["lat", "lon", "_peso"]].values.tolist()
+                        HeatMap(pontos, radius=22, blur=26, min_opacity=0.3,
+                                gradient=grad_anuncios, name="R$/m² pedido").add_to(m)
+                        st.caption("🟣 Calor **roxo/magenta = R$/m² pedido** (tons quentes = "
+                                   "anúncios mais caros). Compare com o calor das transações "
+                                   "(azul→vermelho): se as manchas coincidem, o preço pedido "
+                                   "acompanha o transacionado; se a mancha roxa está mais quente "
+                                   "onde a de transação é fria, há oferta acima do mercado ali.")
+
             # --- Camadas por quarteirão: valorização (cor) + modernização (borda) ---
             # As duas são combináveis: cada quarteirão é desenhado UMA vez, com a
             # cor de preenchimento vinda da valorização e a borda vinda da modernização.
