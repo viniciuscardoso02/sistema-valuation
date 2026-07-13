@@ -1076,7 +1076,7 @@ else:
     )
     anuncios_heatmap = st.sidebar.radio(
         "Camada de calor dos anúncios",
-        ["Desligado", "R$/m² pedido", "Densidade de anúncios"],
+        ["Desligado", "R$/m² pedido", "Valor total pedido", "Densidade de anúncios"],
         help="Sobreponível ao mapa de calor das transações. Tons de roxo/magenta "
              "(distintos do azul→vermelho das transações), para comparar onde o "
              "preço pedido e o transacionado se concentram. Usa anúncios de VENDA.",
@@ -1834,6 +1834,23 @@ if rua or distrito_alvo != "Selecione...":
                                    "(azul→vermelho): se as manchas coincidem, o preço pedido "
                                    "acompanha o transacionado; se a mancha roxa está mais quente "
                                    "onde a de transação é fria, há oferta acima do mercado ali.")
+                elif anuncios_heatmap == "Valor total pedido":
+                    h = an_heat.dropna(subset=["lat", "lon", "valor"]).copy()
+                    h = h[h["valor"] > 0]
+                    if not h.empty:
+                        lo, hi = h["valor"].quantile([0.05, 0.95])
+                        if hi <= lo:
+                            lo, hi = h["valor"].min(), h["valor"].max()
+                        peso = ((h["valor"].clip(lo, hi) - lo) / (hi - lo)) \
+                            if hi > lo else 1.0
+                        h = h.assign(_peso=peso)
+                        pontos = h[["lat", "lon", "_peso"]].values.tolist()
+                        HeatMap(pontos, radius=22, blur=26, min_opacity=0.3,
+                                gradient=grad_anuncios, name="Valor total pedido").add_to(m)
+                        st.caption("🟣 Calor **roxo/magenta = valor total pedido** (preço cheio "
+                                   "do anúncio, não por m²). ⚠️ Como vários anúncios dividem o "
+                                   "mesmo CEP, a mancha quente pode indicar imóveis caros **ou** "
+                                   "muitos anúncios no mesmo ponto — leia junto com a densidade.")
 
             # --- Camadas por quarteirão: valorização (cor) + modernização (borda) ---
             # As duas são combináveis: cada quarteirão é desenhado UMA vez, com a
