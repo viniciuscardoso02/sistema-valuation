@@ -26,21 +26,27 @@ import duckdb
 import folium
 import altair as alt
 
-# --- Renderizador de mapa compatível com versões nova e antiga do streamlit-folium ---
+# --- Renderizador de mapa ---
+# Usamos folium_static (HTML Leaflet puro): mapa totalmente interativo — zoom,
+# clique em cluster, popups — SEM o canal de retorno do st_folium, que causava
+# segmentation fault no Streamlit Cloud. st_folium fica só como reserva.
 try:
+    from streamlit_folium import folium_static
+
+    def render_map(m):
+        try:
+            folium_static(m, width=1100, height=480)
+        except TypeError:
+            folium_static(m)
+
+except Exception:
     from streamlit_folium import st_folium
 
     def render_map(m):
         try:
             st_folium(m, height=480, use_container_width=True, returned_objects=[])
-        except TypeError:  # versões antigas sem use_container_width
+        except TypeError:
             st_folium(m, width=1100, height=480, returned_objects=[])
-
-except Exception:
-    from streamlit_folium import folium_static
-
-    def render_map(m):
-        folium_static(m, width=1100, height=480)
 
 try:
     from folium.plugins import MarkerCluster
