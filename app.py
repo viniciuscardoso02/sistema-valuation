@@ -520,20 +520,41 @@ def carregar_reformados(glob_path, piso_m2=5000, teto_m2=50000,
 
 def classificar_retrofit(anuncio_lat, anuncio_lon, preco_m2_pedido, reformados_df,
                          custo_obra_m2, desconto=0.15, raio_ini=500, raio_max=2000,
-                         passo=250, min_casos=5):
+                         passo=250, min_casos=5, valor_saida_fixo=None):
     """Para um anúncio, decide se vale a pena comprar para retrofit.
 
     Custo de entrada (R$/m²) = preço pedido × (1 - desconto) + custo de obra.
-    Valor de saída (R$/m²)   = mediana dos REFORMADOS num raio ao redor do anúncio,
-                               expandindo o raio até juntar `min_casos` reformados.
 
-    Classificação (sobre quanto o custo de entrada excede o praticado):
-      verde   = custo de entrada <= praticado          (fecha com lucro)
-      amarelo = 0% a 15% acima do praticado             (apertado)
-      vermelho= mais de 15% acima do praticado          (não fecha)
+    Valor de saída (R$/m²), em um de dois modos:
+      - `valor_saida_fixo` informado: usa esse valor direto (preço de venda que o
+        usuário arbitra por conhecer o mercado). Ignora reformados e raio.
+      - `valor_saida_fixo` None: mediana dos REFORMADOS num raio ao redor do
+        anúncio, expandindo o raio até juntar `min_casos` reformados.
+
+    Classificação (sobre quanto o custo de entrada excede o valor de saída):
+      verde   = custo de entrada <= saída                (fecha com lucro)
+      amarelo = 0% a 15% acima da saída                  (apertado)
+      vermelho= mais de 15% acima da saída               (não fecha)
     Retorna dict com cor, números e o raio/contagem usados (para transparência)."""
     if preco_m2_pedido is None or pd.isna(preco_m2_pedido) or preco_m2_pedido <= 0:
         return {"cor": "cinza", "motivo": "sem preço/m² pedido"}
+
+    # MODO MANUAL: valor de saída arbitrado — não depende dos reformados
+    if valor_saida_fixo is not None and valor_saida_fixo > 0:
+        custo_entrada = preco_m2_pedido * (1 - desconto) + custo_obra_m2
+        excesso = custo_entrada / valor_saida_fixo - 1
+        cor = "verde" if excesso <= 0 else ("amarelo" if excesso <= 0.15 else "vermelho")
+        return {
+            "cor": cor,
+            "custo_entrada": custo_entrada,
+            "praticado": valor_saida_fixo,
+            "excesso": excesso,
+            "raio_usado": None,
+            "n_reformados": None,
+            "preco_descontado": preco_m2_pedido * (1 - desconto),
+            "modo": "manual",
+        }
+
     if reformados_df is None or reformados_df.empty:
         return {"cor": "cinza", "motivo": "sem base de reformados"}
 
@@ -583,6 +604,7 @@ def classificar_retrofit(anuncio_lat, anuncio_lon, preco_m2_pedido, reformados_d
         "raio_usado": raio,
         "n_reformados": n,
         "preco_descontado": preco_m2_pedido * (1 - desconto),
+        "modo": "vizinhos",
     }
 
 
@@ -1186,6 +1208,8 @@ if ANUNCIOS_DF is None:
     retrofit_obra = 4000
     retrofit_piso = 5000
     retrofit_teto = 50000
+    retrofit_modo = "Imóveis reformados ao redor"
+    retrofit_venda_m2 = None
 else:
     st.sidebar.caption("Preço **pedido** (oferta). Base separada das transações — "
                        "não entra na média do ITBI. Segue o filtro *Uso do Imóvel*.")
@@ -1212,11 +1236,11 @@ else:
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎯 Análise de retrofit")
     st.sidebar.caption("Pinta cada anúncio de **verde/amarelo/vermelho** conforme "
-                       "a viabilidade de comprar, reformar e revender no preço da região.")
+                       "a viabilidade de comprar, reformar e revender.")
     retrofit_ligado = st.sidebar.checkbox(
         "Classificar anúncios para retrofit", value=False,
         help="Compra = preço pedido − desconto. Custo total = compra + obra. "
-             "Compara com o R$/m² dos imóveis reformados ao redor.",
+             "Compara com o preço de venda (dos reformados ao redor ou o que você definir).",
     )
     retrofit_desconto = st.sidebar.slider(
         "Desconto de negociação (%)", 0, 40, 15, disabled=not retrofit_ligado,
@@ -1227,13 +1251,34 @@ else:
         disabled=not retrofit_ligado,
         help="Custo estimado da reforma por m², somado ao preço de compra.",
     )
-    st.sidebar.caption("Faixa de mercado dos reformados (remove valores subdeclarados "
-                       "da base ITBI, como heranças e doações):")
-    fx1, fx2 = st.sidebar.columns(2)
-    retrofit_piso = fx1.number_input("Piso R$/m²", min_value=0, max_value=100000,
-                                     value=5000, step=500, disabled=not retrofit_ligado)
-    retrofit_teto = fx2.number_input("Teto R$/m²", min_value=1000, max_value=200000,
-                                     value=50000, step=1000, disabled=not retrofit_ligado)
+
+    retrofit_modo = st.sidebar.radio(
+        "Preço de venda (saída) vem de:",
+        ["Imóveis reformados ao redor", "Valor que eu definir"],
+        disabled=not retrofit_ligado,
+        help="Reformados ao redor: usa a mediana do R$/m² dos imóveis reformados "
+             "perto de cada anúncio (respeita período/uso/zona). "
+             "Valor definido: usa um R$/m² fixo que você arbitra, igual para todos.",
+    )
+
+    if retrofit_modo == "Valor que eu definir":
+        retrofit_venda_m2 = st.sidebar.number_input(
+            "Preço de venda pós-reforma (R$/m²)", min_value=0, max_value=200000,
+            value=15000, step=500, disabled=not retrofit_ligado,
+            help="Por quanto você acredita que consegue revender o m² reformado "
+                 "nesta região. Aplicado a todos os anúncios.",
+        )
+        # faixa de mercado não é usada neste modo (não consulta reformados)
+        retrofit_piso, retrofit_teto = 5000, 50000
+    else:
+        retrofit_venda_m2 = None
+        st.sidebar.caption("Faixa de mercado dos reformados (remove valores subdeclarados "
+                           "da base ITBI, como heranças e doações):")
+        fx1, fx2 = st.sidebar.columns(2)
+        retrofit_piso = fx1.number_input("Piso R$/m²", min_value=0, max_value=100000,
+                                         value=5000, step=500, disabled=not retrofit_ligado)
+        retrofit_teto = fx2.number_input("Teto R$/m²", min_value=1000, max_value=200000,
+                                         value=50000, step=1000, disabled=not retrofit_ligado)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🗺️ Zoneamento")
@@ -2249,9 +2294,11 @@ if rua or distrito_alvo != "Selecione...":
                     # cores dos pinos por classificação de retrofit (folium.Icon)
                     CORES_RETROFIT = {"verde": "green", "amarelo": "orange",
                                       "vermelho": "red", "cinza": "lightgray"}
-                    # carrega reformados uma vez, se a análise estiver ligada
+                    # carrega reformados só no modo "vizinhos" (no manual não são usados)
                     reformados_df = None
-                    if retrofit_ligado:
+                    usa_manual = (retrofit_modo == "Valor que eu definir"
+                                  and retrofit_venda_m2)
+                    if retrofit_ligado and not usa_manual:
                         reformados_df = carregar_reformados(
                             PARQUET_GLOB, piso_m2=retrofit_piso, teto_m2=retrofit_teto,
                             ano_min=ano_min, ano_max=ano_max,
@@ -2289,7 +2336,8 @@ if rua or distrito_alvo != "Selecione...":
                         if retrofit_ligado and a["negocio"] == "Venda":
                             cls = classificar_retrofit(
                                 a["lat"], a["lon"], pm2, reformados_df,
-                                custo_obra_m2=retrofit_obra, desconto=retrofit_desconto)
+                                custo_obra_m2=retrofit_obra, desconto=retrofit_desconto,
+                                valor_saida_fixo=(retrofit_venda_m2 if usa_manual else None))
                             cor = cls.get("cor", "cinza")
                             contagem_retrofit[cor] = contagem_retrofit.get(cor, 0) + 1
                             cor_pino = CORES_RETROFIT.get(cor, "lightgray")
@@ -2300,6 +2348,21 @@ if rua or distrito_alvo != "Selecione...":
                             else:
                                 nome_cor = {"verde": "🟢 VERDE", "amarelo": "🟡 AMARELO",
                                             "vermelho": "🔴 VERMELHO"}[cor]
+                                # a origem do preço de venda muda conforme o modo
+                                if cls.get("modo") == "manual":
+                                    linha_saida = (
+                                        f"venda estimada (definida): "
+                                        f"{formata_moeda(cls['praticado'])}/m²<br>"
+                                        f"<b>{cls['excesso']*100:+.0f}%</b> vs venda estimada"
+                                    )
+                                else:
+                                    linha_saida = (
+                                        f"venda (reformados ao redor): "
+                                        f"{formata_moeda(cls['praticado'])}/m²<br>"
+                                        f"<b>{cls['excesso']*100:+.0f}%</b> vs praticado · "
+                                        f"<span style='color:#555'>{cls['n_reformados']} ref. "
+                                        f"em {cls['raio_usado']}m</span>"
+                                    )
                                 html += (
                                     "<hr style='margin:4px 0'>"
                                     f"<b>Retrofit: {nome_cor}</b><br>"
@@ -2307,12 +2370,9 @@ if rua or distrito_alvo != "Selecione...":
                                     f"{formata_moeda(cls['preco_descontado'])}/m²<br>"
                                     f"+ obra: {formata_moeda(retrofit_obra)}/m²<br>"
                                     f"= <b>custo total {formata_moeda(cls['custo_entrada'])}/m²</b><br>"
-                                    f"praticado reformados: {formata_moeda(cls['praticado'])}/m²<br>"
-                                    f"<b>{cls['excesso']*100:+.0f}%</b> vs praticado · "
-                                    f"<span style='color:#555'>{cls['n_reformados']} ref. "
-                                    f"em {cls['raio_usado']}m</span>"
+                                    + linha_saida
                                 )
-                                tooltip = f"{nome_cor} · {cls['excesso']*100:+.0f}% vs praticado"
+                                tooltip = f"{nome_cor} · {cls['excesso']*100:+.0f}%"
                         html += "</div>"
 
                         folium.Marker(
@@ -2325,12 +2385,19 @@ if rua or distrito_alvo != "Selecione...":
                     n_v = int((anuncios_regiao["negocio"] == "Venda").sum())
                     n_a = int((anuncios_regiao["negocio"] == "Aluguel").sum())
                     if retrofit_ligado:
+                        if usa_manual:
+                            origem = (f"venda estimada por você em "
+                                      f"**{formata_moeda(retrofit_venda_m2)}/m²**")
+                        else:
+                            origem = ("preço dos **reformados ao redor** (respeita "
+                                      "período, uso e zonas excluídas)")
                         st.caption(
                             f"🎯 **Retrofit** — {contagem_retrofit['verde']} 🟢 viáveis · "
                             f"{contagem_retrofit['amarelo']} 🟡 apertados · "
                             f"{contagem_retrofit['vermelho']} 🔴 inviáveis · "
                             f"{contagem_retrofit['cinza']} ⚪ sem dados. "
-                            f"Verde = compra+obra fica no preço dos reformados ou abaixo; "
+                            f"Saída = {origem}. "
+                            f"Verde = compra+obra fica na venda ou abaixo; "
                             f"amarelo = até 15% acima; vermelho = mais de 15% acima. "
                             f"Desconto {int(retrofit_desconto*100)}%, obra "
                             f"{formata_moeda(retrofit_obra)}/m². Clique no pino para a conta.")
