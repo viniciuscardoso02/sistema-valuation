@@ -465,26 +465,46 @@ def anuncios_da_regiao(anuncios, tipo, negocios, centro=None, raio_m=None, geom_
 
 
 @st.cache_data(show_spinner=False)
-def carregar_reformados(glob_path, piso_m2=5000, teto_m2=50000):
-    """Carrega TODAS as transações de imóveis reformados (Modernizada=true) com
-    coordenada, área e valor válidos, já com R$/m² calculado. Usado como 'valor de
-    saída' (preço-alvo pós-reforma) na análise de viabilidade de retrofit.
+def carregar_reformados(glob_path, piso_m2=5000, teto_m2=50000,
+                        ano_min=None, ano_max=None, uso_sql="", zonas_excl=None):
+    """Carrega transações de imóveis reformados (Modernizada=true) com coordenada,
+    área e valor válidos, já com R$/m² calculado. É o 'valor de saída' (preço-alvo
+    pós-reforma) da análise de retrofit.
 
-    IMPORTANTE: a base ITBI é o VALOR DECLARADO — ~72% dos reformados têm valor
-    subdeclarado (herança, doação, transferência) abaixo de R$1.000/m², que
-    contaminam a mediana. Por isso filtramos pela FAIXA DE MERCADO [piso, teto],
-    digitável, para o 'praticado' refletir vendas reais. Cacheado; filtro por raio
-    é feito em memória."""
+    Respeita os MESMOS filtros da barra lateral aplicados ao resto do app, para a
+    referência ser coerente com o recorte que o usuário está vendo:
+      - período (ano_min..ano_max)
+      - uso (uso_sql: cláusula já pronta de Residenciais/Apartamentos)
+      - zoneamento excluído (zonas_excl: lista de zonas a remover)
+
+    A base ITBI é VALOR DECLARADO — ~72% dos reformados têm valor subdeclarado
+    (herança, doação) abaixo de R$1.000/m², que contaminam a mediana; por isso a
+    FAIXA DE MERCADO [piso, teto], digitável. Cacheado por combinação de filtros;
+    filtro por raio é feito em memória."""
     lat_e = coord_sql("Latitude")
     lon_e = coord_sql("Longitude")
     val_e = coord_sql(COL_VAL)
     area_e = coord_sql(COL_AREA)
+    ano_e = coord_sql("Ano_Transacao")
+
+    cond_ano = ""
+    if ano_min is not None and ano_max is not None:
+        cond_ano = f" AND {ano_e} BETWEEN {int(ano_min)} AND {int(ano_max)}"
+
+    cond_zona = ""
+    if zonas_excl:
+        lista = ", ".join("'" + str(z).replace("'", "''") + "'" for z in zonas_excl)
+        cond_zona = f" AND (Zona IS NULL OR Zona NOT IN ({lista}))"
+
     q = f"""
     WITH b AS (
         SELECT {lat_e} AS lat, {lon_e} AS lon,
                {val_e} AS valor, {area_e} AS area
         FROM read_parquet('{glob_path}', union_by_name=true)
         WHERE LOWER(CAST(Modernizada AS VARCHAR)) = 'true'
+        {uso_sql}
+        {cond_ano}
+        {cond_zona}
     )
     SELECT lat, lon, valor / area AS preco_m2
     FROM b
@@ -2233,7 +2253,10 @@ if rua or distrito_alvo != "Selecione...":
                     reformados_df = None
                     if retrofit_ligado:
                         reformados_df = carregar_reformados(
-                            PARQUET_GLOB, piso_m2=retrofit_piso, teto_m2=retrofit_teto)
+                            PARQUET_GLOB, piso_m2=retrofit_piso, teto_m2=retrofit_teto,
+                            ano_min=ano_min, ano_max=ano_max,
+                            uso_sql=condicao_extra,
+                            zonas_excl=tuple(zonas_excluidas) if zonas_excluidas else None)
                     contagem_retrofit = {"verde": 0, "amarelo": 0, "vermelho": 0, "cinza": 0}
 
                     for _, a in anuncios_regiao.iterrows():
