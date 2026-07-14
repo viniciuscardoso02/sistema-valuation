@@ -464,6 +464,108 @@ def anuncios_da_regiao(anuncios, tipo, negocios, centro=None, raio_m=None, geom_
     return d
 
 
+@st.cache_data(show_spinner=False)
+def carregar_reformados(glob_path, piso_m2=5000, teto_m2=50000):
+    """Carrega TODAS as transações de imóveis reformados (Modernizada=true) com
+    coordenada, área e valor válidos, já com R$/m² calculado. Usado como 'valor de
+    saída' (preço-alvo pós-reforma) na análise de viabilidade de retrofit.
+
+    IMPORTANTE: a base ITBI é o VALOR DECLARADO — ~72% dos reformados têm valor
+    subdeclarado (herança, doação, transferência) abaixo de R$1.000/m², que
+    contaminam a mediana. Por isso filtramos pela FAIXA DE MERCADO [piso, teto],
+    digitável, para o 'praticado' refletir vendas reais. Cacheado; filtro por raio
+    é feito em memória."""
+    lat_e = coord_sql("Latitude")
+    lon_e = coord_sql("Longitude")
+    val_e = coord_sql(COL_VAL)
+    area_e = coord_sql(COL_AREA)
+    q = f"""
+    WITH b AS (
+        SELECT {lat_e} AS lat, {lon_e} AS lon,
+               {val_e} AS valor, {area_e} AS area
+        FROM read_parquet('{glob_path}', union_by_name=true)
+        WHERE LOWER(CAST(Modernizada AS VARCHAR)) = 'true'
+    )
+    SELECT lat, lon, valor / area AS preco_m2
+    FROM b
+    WHERE lat IS NOT NULL AND lon IS NOT NULL
+      AND area > 0 AND valor > 0
+      AND (valor / area) BETWEEN {float(piso_m2)} AND {float(teto_m2)}
+    """
+    try:
+        return run_query(q)
+    except Exception:
+        return pd.DataFrame(columns=["lat", "lon", "preco_m2"])
+
+
+def classificar_retrofit(anuncio_lat, anuncio_lon, preco_m2_pedido, reformados_df,
+                         custo_obra_m2, desconto=0.15, raio_ini=500, raio_max=2000,
+                         passo=250, min_casos=5):
+    """Para um anúncio, decide se vale a pena comprar para retrofit.
+
+    Custo de entrada (R$/m²) = preço pedido × (1 - desconto) + custo de obra.
+    Valor de saída (R$/m²)   = mediana dos REFORMADOS num raio ao redor do anúncio,
+                               expandindo o raio até juntar `min_casos` reformados.
+
+    Classificação (sobre quanto o custo de entrada excede o praticado):
+      verde   = custo de entrada <= praticado          (fecha com lucro)
+      amarelo = 0% a 15% acima do praticado             (apertado)
+      vermelho= mais de 15% acima do praticado          (não fecha)
+    Retorna dict com cor, números e o raio/contagem usados (para transparência)."""
+    if preco_m2_pedido is None or pd.isna(preco_m2_pedido) or preco_m2_pedido <= 0:
+        return {"cor": "cinza", "motivo": "sem preço/m² pedido"}
+    if reformados_df is None or reformados_df.empty:
+        return {"cor": "cinza", "motivo": "sem base de reformados"}
+
+    # distância de cada reformado ao anúncio (vetorizado)
+    import numpy as np
+    dlat = np.radians(reformados_df["lat"].values - anuncio_lat)
+    dlon = np.radians(reformados_df["lon"].values - anuncio_lon)
+    latm = np.radians((reformados_df["lat"].values + anuncio_lat) / 2)
+    dist = 6371000 * np.hypot(dlon * np.cos(latm), dlat)
+
+    raio = raio_ini
+    praticado = None
+    n = 0
+    while raio <= raio_max:
+        sel = reformados_df[dist <= raio]
+        n = len(sel)
+        if n >= min_casos:
+            praticado = sel["preco_m2"].median()
+            break
+        raio += passo
+    if praticado is None:
+        # não achou o mínimo nem no raio máximo: usa o que tem, se houver algo
+        sel = reformados_df[dist <= raio_max]
+        n = len(sel)
+        if n == 0:
+            return {"cor": "cinza", "motivo": f"nenhum reformado em {raio_max} m"}
+        praticado = sel["preco_m2"].median()
+        raio = raio_max
+
+    custo_entrada = preco_m2_pedido * (1 - desconto) + custo_obra_m2
+    excesso = (custo_entrada / praticado - 1) if praticado > 0 else None
+
+    if excesso is None:
+        cor = "cinza"
+    elif excesso <= 0:
+        cor = "verde"
+    elif excesso <= 0.15:
+        cor = "amarelo"
+    else:
+        cor = "vermelho"
+
+    return {
+        "cor": cor,
+        "custo_entrada": custo_entrada,
+        "praticado": praticado,
+        "excesso": excesso,
+        "raio_usado": raio,
+        "n_reformados": n,
+        "preco_descontado": preco_m2_pedido * (1 - desconto),
+    }
+
+
 # --- Zoneamento (LPUOS 2016) buscado sob demanda por área, direto do GeoSampa ---
 WFS_GEOSAMPA = "http://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
 CAMADA_ZONEAMENTO = "geoportal:zoneamento_2016_map1"
@@ -1059,6 +1161,11 @@ if ANUNCIOS_DF is None:
     mostrar_anuncios = False
     anuncio_negocios = []
     anuncios_heatmap = "Desligado"
+    retrofit_ligado = False
+    retrofit_desconto = 0.15
+    retrofit_obra = 4000
+    retrofit_piso = 5000
+    retrofit_teto = 50000
 else:
     st.sidebar.caption("Preço **pedido** (oferta). Base separada das transações — "
                        "não entra na média do ITBI. Segue o filtro *Uso do Imóvel*.")
@@ -1081,6 +1188,32 @@ else:
              "(distintos do azul→vermelho das transações), para comparar onde o "
              "preço pedido e o transacionado se concentram. Usa anúncios de VENDA.",
     )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎯 Análise de retrofit")
+    st.sidebar.caption("Pinta cada anúncio de **verde/amarelo/vermelho** conforme "
+                       "a viabilidade de comprar, reformar e revender no preço da região.")
+    retrofit_ligado = st.sidebar.checkbox(
+        "Classificar anúncios para retrofit", value=False,
+        help="Compra = preço pedido − desconto. Custo total = compra + obra. "
+             "Compara com o R$/m² dos imóveis reformados ao redor.",
+    )
+    retrofit_desconto = st.sidebar.slider(
+        "Desconto de negociação (%)", 0, 40, 15, disabled=not retrofit_ligado,
+        help="Abatimento sobre o preço pedido, assumido na compra.",
+    ) / 100.0
+    retrofit_obra = st.sidebar.number_input(
+        "Custo de obra (R$/m²)", min_value=0, max_value=50000, value=4000, step=500,
+        disabled=not retrofit_ligado,
+        help="Custo estimado da reforma por m², somado ao preço de compra.",
+    )
+    st.sidebar.caption("Faixa de mercado dos reformados (remove valores subdeclarados "
+                       "da base ITBI, como heranças e doações):")
+    fx1, fx2 = st.sidebar.columns(2)
+    retrofit_piso = fx1.number_input("Piso R$/m²", min_value=0, max_value=100000,
+                                     value=5000, step=500, disabled=not retrofit_ligado)
+    retrofit_teto = fx2.number_input("Teto R$/m²", min_value=1000, max_value=200000,
+                                     value=50000, step=1000, disabled=not retrofit_ligado)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🗺️ Zoneamento")
@@ -2077,10 +2210,14 @@ if rua or distrito_alvo != "Selecione...":
 
             # --- Camada de anúncios (preço pedido), base separada ---
             anuncios_regiao = None
-            if mostrar_anuncios and ANUNCIOS_DF is not None:
+            if (mostrar_anuncios or retrofit_ligado) and ANUNCIOS_DF is not None:
                 geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
+                # se retrofit está ligado, garante que Venda entra (a análise é de venda)
+                negocios_mostrar = list(anuncio_negocios)
+                if retrofit_ligado and "Venda" not in negocios_mostrar:
+                    negocios_mostrar = negocios_mostrar + ["Venda"]
                 anuncios_regiao = anuncios_da_regiao(
-                    ANUNCIOS_DF, tipo, anuncio_negocios,
+                    ANUNCIOS_DF, tipo, negocios_mostrar,
                     centro=(None if modo_distrito else centro),
                     raio_m=(None if modo_distrito else raio),
                     geom_dist=geom_d,
@@ -2089,6 +2226,16 @@ if rua or distrito_alvo != "Selecione...":
                     st.caption("ℹ️ Nenhum anúncio da Matú nesta região com os filtros atuais.")
                 else:
                     CORES_NEG = {"Venda": "black", "Aluguel": "cadetblue"}
+                    # cores dos pinos por classificação de retrofit (folium.Icon)
+                    CORES_RETROFIT = {"verde": "green", "amarelo": "orange",
+                                      "vermelho": "red", "cinza": "lightgray"}
+                    # carrega reformados uma vez, se a análise estiver ligada
+                    reformados_df = None
+                    if retrofit_ligado:
+                        reformados_df = carregar_reformados(
+                            PARQUET_GLOB, piso_m2=retrofit_piso, teto_m2=retrofit_teto)
+                    contagem_retrofit = {"verde": 0, "amarelo": 0, "vermelho": 0, "cinza": 0}
+
                     for _, a in anuncios_regiao.iterrows():
                         pm2 = a.get("preco_m2_pedido")
                         pm2_txt = formata_moeda(pm2) if pd.notna(pm2) else "—"
@@ -2110,21 +2257,65 @@ if rua or distrito_alvo != "Selecione...":
                             + (f" · <b>{pm2_txt}/m²</b>" if a.get("negocio") == "Venda" else "")
                             + f"<br><span style='color:#555'>{quartos}</span><br>"
                             f"<span style='color:#555'>constr. {a.get('area_construida','—')} m² · "
-                            f"terreno {a.get('area_terreno','—')} m²</span></div>"
+                            f"terreno {a.get('area_terreno','—')} m²</span>"
                         )
+
+                        # classificação de retrofit (só venda com preço/m²)
+                        cor_pino = CORES_NEG.get(a["negocio"], "gray")
+                        tooltip = f"{a.get('negocio')} · {pm2_txt}/m²"
+                        if retrofit_ligado and a["negocio"] == "Venda":
+                            cls = classificar_retrofit(
+                                a["lat"], a["lon"], pm2, reformados_df,
+                                custo_obra_m2=retrofit_obra, desconto=retrofit_desconto)
+                            cor = cls.get("cor", "cinza")
+                            contagem_retrofit[cor] = contagem_retrofit.get(cor, 0) + 1
+                            cor_pino = CORES_RETROFIT.get(cor, "lightgray")
+                            if cor == "cinza":
+                                html += ("<br><b>Retrofit:</b> sem dados suficientes "
+                                         f"({cls.get('motivo','—')})")
+                                tooltip = f"Retrofit: indefinido · {pm2_txt}/m²"
+                            else:
+                                nome_cor = {"verde": "🟢 VERDE", "amarelo": "🟡 AMARELO",
+                                            "vermelho": "🔴 VERMELHO"}[cor]
+                                html += (
+                                    "<hr style='margin:4px 0'>"
+                                    f"<b>Retrofit: {nome_cor}</b><br>"
+                                    f"compra ({int(retrofit_desconto*100)}% desc.): "
+                                    f"{formata_moeda(cls['preco_descontado'])}/m²<br>"
+                                    f"+ obra: {formata_moeda(retrofit_obra)}/m²<br>"
+                                    f"= <b>custo total {formata_moeda(cls['custo_entrada'])}/m²</b><br>"
+                                    f"praticado reformados: {formata_moeda(cls['praticado'])}/m²<br>"
+                                    f"<b>{cls['excesso']*100:+.0f}%</b> vs praticado · "
+                                    f"<span style='color:#555'>{cls['n_reformados']} ref. "
+                                    f"em {cls['raio_usado']}m</span>"
+                                )
+                                tooltip = f"{nome_cor} · {cls['excesso']*100:+.0f}% vs praticado"
+                        html += "</div>"
+
                         folium.Marker(
                             location=[a["lat"], a["lon"]],
-                            icon=folium.Icon(color=CORES_NEG.get(a["negocio"], "gray"),
-                                             icon="home", prefix="fa"),
-                            popup=folium.Popup(html, max_width=250),
-                            tooltip=f"{a.get('negocio')} · {pm2_txt}/m²",
+                            icon=folium.Icon(color=cor_pino, icon="home", prefix="fa"),
+                            popup=folium.Popup(html, max_width=260),
+                            tooltip=tooltip,
                         ).add_to(m)
+
                     n_v = int((anuncios_regiao["negocio"] == "Venda").sum())
                     n_a = int((anuncios_regiao["negocio"] == "Aluguel").sum())
-                    st.caption(f"📣 **Anúncios (Matú)** — {len(anuncios_regiao)} nesta região "
-                               f"({n_v} venda, {n_a} aluguel). Pino preto = venda, "
-                               f"azul-petróleo = aluguel. Preço **pedido**; posição pelo CEP "
-                               f"(precisão de rua). Nº com “?” é de baixa confiança.")
+                    if retrofit_ligado:
+                        st.caption(
+                            f"🎯 **Retrofit** — {contagem_retrofit['verde']} 🟢 viáveis · "
+                            f"{contagem_retrofit['amarelo']} 🟡 apertados · "
+                            f"{contagem_retrofit['vermelho']} 🔴 inviáveis · "
+                            f"{contagem_retrofit['cinza']} ⚪ sem dados. "
+                            f"Verde = compra+obra fica no preço dos reformados ou abaixo; "
+                            f"amarelo = até 15% acima; vermelho = mais de 15% acima. "
+                            f"Desconto {int(retrofit_desconto*100)}%, obra "
+                            f"{formata_moeda(retrofit_obra)}/m². Clique no pino para a conta.")
+                    else:
+                        st.caption(f"📣 **Anúncios (Matú)** — {len(anuncios_regiao)} nesta região "
+                                   f"({n_v} venda, {n_a} aluguel). Pino preto = venda, "
+                                   f"azul-petróleo = aluguel. Preço **pedido**; posição pelo CEP "
+                                   f"(precisão de rua). Nº com “?” é de baixa confiança.")
 
             # --- Pontos de interesse (OpenStreetMap), opcional ---
             contagem_pois = {}
