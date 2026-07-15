@@ -518,93 +518,119 @@ def carregar_reformados(glob_path, piso_m2=5000, teto_m2=50000,
         return pd.DataFrame(columns=["lat", "lon", "preco_m2"])
 
 
-def classificar_retrofit(anuncio_lat, anuncio_lon, preco_m2_pedido, reformados_df,
-                         custo_obra_m2, desconto=0.15, raio_ini=500, raio_max=2000,
-                         passo=250, min_casos=5, valor_saida_fixo=None):
-    """Para um anúncio, decide se vale a pena comprar para retrofit.
-
-    Custo de entrada (R$/m²) = preço pedido × (1 - desconto) + custo de obra.
-
-    Valor de saída (R$/m²), em um de dois modos:
-      - `valor_saida_fixo` informado: usa esse valor direto (preço de venda que o
-        usuário arbitra por conhecer o mercado). Ignora reformados e raio.
-      - `valor_saida_fixo` None: mediana dos REFORMADOS num raio ao redor do
-        anúncio, expandindo o raio até juntar `min_casos` reformados.
-
-    Classificação (sobre quanto o custo de entrada excede o valor de saída):
-      verde   = custo de entrada <= saída                (fecha com lucro)
-      amarelo = 0% a 15% acima da saída                  (apertado)
-      vermelho= mais de 15% acima da saída               (não fecha)
-    Retorna dict com cor, números e o raio/contagem usados (para transparência)."""
-    if preco_m2_pedido is None or pd.isna(preco_m2_pedido) or preco_m2_pedido <= 0:
-        return {"cor": "cinza", "motivo": "sem preço/m² pedido"}
-
-    # MODO MANUAL: valor de saída arbitrado — não depende dos reformados
-    if valor_saida_fixo is not None and valor_saida_fixo > 0:
-        custo_entrada = preco_m2_pedido * (1 - desconto) + custo_obra_m2
-        excesso = custo_entrada / valor_saida_fixo - 1
-        cor = "verde" if excesso <= 0 else ("amarelo" if excesso <= 0.15 else "vermelho")
-        return {
-            "cor": cor,
-            "custo_entrada": custo_entrada,
-            "praticado": valor_saida_fixo,
-            "excesso": excesso,
-            "raio_usado": None,
-            "n_reformados": None,
-            "preco_descontado": preco_m2_pedido * (1 - desconto),
-            "modo": "manual",
-        }
-
+def _venda_m2_vizinhos(anuncio_lat, anuncio_lon, reformados_df,
+                       raio_ini=500, raio_max=2000, passo=250, min_casos=5):
+    """Mediana do R$/m² CONSTRUÍDO dos imóveis reformados ao redor do anúncio.
+    Expande o raio de `raio_ini` até `raio_max` enquanto não juntar `min_casos`.
+    Retorna (venda_m2, raio_usado, n_casos) ou (None, None, 0)."""
     if reformados_df is None or reformados_df.empty:
-        return {"cor": "cinza", "motivo": "sem base de reformados"}
-
-    # distância de cada reformado ao anúncio (vetorizado)
-    import numpy as np
+        return None, None, 0
     dlat = np.radians(reformados_df["lat"].values - anuncio_lat)
     dlon = np.radians(reformados_df["lon"].values - anuncio_lon)
     latm = np.radians((reformados_df["lat"].values + anuncio_lat) / 2)
     dist = 6371000 * np.hypot(dlon * np.cos(latm), dlat)
 
     raio = raio_ini
-    praticado = None
-    n = 0
     while raio <= raio_max:
         sel = reformados_df[dist <= raio]
-        n = len(sel)
-        if n >= min_casos:
-            praticado = sel["preco_m2"].median()
-            break
+        if len(sel) >= min_casos:
+            return sel["preco_m2"].median(), raio, len(sel)
         raio += passo
-    if praticado is None:
-        # não achou o mínimo nem no raio máximo: usa o que tem, se houver algo
-        sel = reformados_df[dist <= raio_max]
-        n = len(sel)
-        if n == 0:
-            return {"cor": "cinza", "motivo": f"nenhum reformado em {raio_max} m"}
-        praticado = sel["preco_m2"].median()
-        raio = raio_max
+    sel = reformados_df[dist <= raio_max]
+    if len(sel) == 0:
+        return None, None, 0
+    return sel["preco_m2"].median(), raio_max, len(sel)
 
-    custo_entrada = preco_m2_pedido * (1 - desconto) + custo_obra_m2
-    excesso = (custo_entrada / praticado - 1) if praticado > 0 else None
 
-    if excesso is None:
-        cor = "cinza"
-    elif excesso <= 0:
+def classificar_retrofit(anuncio_lat, anuncio_lon, valor_pedido, area_construida,
+                         area_terreno, reformados_df, custo_obra_m2, desconto=0.15,
+                         area_projetada=0, valor_saida_fixo=None,
+                         raio_ini=500, raio_max=2000, passo=250, min_casos=5,
+                         corte_verde=0.15):
+    """Viabilidade de comprar um anúncio para retrofit. Conta em VALORES TOTAIS,
+    porque compra e venda têm bases diferentes (terreno x construída):
+
+        Compra        = preço pedido × (1 − desconto)
+                        (exibida também como R$/m² de TERRENO)
+        Área de venda = max(área construída atual, área projetada)
+                        — nunca reduz: se a casa já é maior, mantém a atual
+        Obra          = custo_obra_m2 × área de venda
+                        (sobre a área FINAL; senão a ampliação sairia de graça)
+        Venda         = venda_m2 × área de venda
+                        venda_m2 = R$/m² CONSTRUÍDO, de um de dois modos:
+                          · `valor_saida_fixo`: valor arbitrado pelo usuário
+                          · senão: mediana dos reformados ao redor (raio expansível)
+
+        Lucro %       = (Venda − Compra − Obra) ÷ (Compra + Obra)
+
+    Cores (sobre o LUCRO):
+        verde    = lucro >= corte_verde (padrão 15%)
+        amarelo  = 0 <= lucro < corte_verde     (apertado)
+        vermelho = lucro < 0                    (prejuízo)
+
+    A área de terreno é apenas lente de leitura: se faltar, o imóvel continua
+    sendo classificado (só não exibe o R$/m² de terreno)."""
+    # requisitos mínimos da conta
+    if valor_pedido is None or pd.isna(valor_pedido) or valor_pedido <= 0:
+        return {"cor": "cinza", "motivo": "sem valor do anúncio"}
+    if area_construida is None or pd.isna(area_construida) or area_construida <= 0:
+        return {"cor": "cinza", "motivo": "sem área construída"}
+
+    # área que será vendida: a projetada só vale se for MAIOR que a atual
+    area_venda = float(area_construida)
+    if area_projetada and area_projetada > area_venda:
+        area_venda = float(area_projetada)
+    ampliou = area_venda > float(area_construida)
+
+    # preço de venda por m² construído
+    if valor_saida_fixo is not None and valor_saida_fixo > 0:
+        venda_m2, raio_usado, n_ref, modo = float(valor_saida_fixo), None, None, "manual"
+    else:
+        venda_m2, raio_usado, n_ref = _venda_m2_vizinhos(
+            anuncio_lat, anuncio_lon, reformados_df,
+            raio_ini=raio_ini, raio_max=raio_max, passo=passo, min_casos=min_casos)
+        modo = "vizinhos"
+        if venda_m2 is None or venda_m2 <= 0:
+            return {"cor": "cinza",
+                    "motivo": f"nenhum reformado em {raio_max} m"}
+
+    compra = float(valor_pedido) * (1 - desconto)
+    obra = float(custo_obra_m2) * area_venda
+    receita = venda_m2 * area_venda
+    custo_total = compra + obra
+    if custo_total <= 0:
+        return {"cor": "cinza", "motivo": "custo inválido"}
+
+    lucro = receita - custo_total
+    lucro_pct = lucro / custo_total
+
+    if lucro_pct >= corte_verde:
         cor = "verde"
-    elif excesso <= 0.15:
+    elif lucro_pct >= 0:
         cor = "amarelo"
     else:
         cor = "vermelho"
 
+    # lente de leitura: quanto se paga por m² de terreno (opcional)
+    compra_m2_terreno = None
+    if area_terreno is not None and not pd.isna(area_terreno) and area_terreno > 0:
+        compra_m2_terreno = compra / float(area_terreno)
+
     return {
         "cor": cor,
-        "custo_entrada": custo_entrada,
-        "praticado": praticado,
-        "excesso": excesso,
-        "raio_usado": raio,
-        "n_reformados": n,
-        "preco_descontado": preco_m2_pedido * (1 - desconto),
-        "modo": "vizinhos",
+        "compra": compra,
+        "compra_m2_terreno": compra_m2_terreno,
+        "obra": obra,
+        "receita": receita,
+        "custo_total": custo_total,
+        "lucro": lucro,
+        "lucro_pct": lucro_pct,
+        "venda_m2": venda_m2,
+        "area_venda": area_venda,
+        "ampliou": ampliou,
+        "raio_usado": raio_usado,
+        "n_reformados": n_ref,
+        "modo": modo,
     }
 
 
@@ -1210,6 +1236,7 @@ if ANUNCIOS_DF is None:
     retrofit_teto = 50000
     retrofit_modo = "Imóveis reformados ao redor"
     retrofit_venda_m2 = None
+    retrofit_area_proj = 0
 else:
     st.sidebar.caption("Preço **pedido** (oferta). Base separada das transações — "
                        "não entra na média do ITBI. Segue o filtro *Uso do Imóvel*.")
@@ -1259,6 +1286,15 @@ else:
         help="Reformados ao redor: usa a mediana do R$/m² dos imóveis reformados "
              "perto de cada anúncio (respeita período/uso/zona). "
              "Valor definido: usa um R$/m² fixo que você arbitra, igual para todos.",
+    )
+
+    retrofit_area_proj = st.sidebar.number_input(
+        "Área projetada (m²)", min_value=0, max_value=20000, value=0, step=50,
+        disabled=not retrofit_ligado,
+        help="Área construída que você pretende entregar após a obra. Deixe 0 para "
+             "usar a área atual de cada imóvel. Se o imóvel já for MAIOR que a "
+             "projetada, mantém a área dele (nunca reduz). A obra e a venda são "
+             "calculadas sobre esta área.",
     )
 
     if retrofit_modo == "Valor que eu definir":
@@ -2330,13 +2366,20 @@ if rua or distrito_alvo != "Selecione...":
                             f"terreno {a.get('area_terreno','—')} m²</span>"
                         )
 
-                        # classificação de retrofit (só venda com preço/m²)
+                        # classificação de retrofit (só venda)
                         cor_pino = CORES_NEG.get(a["negocio"], "gray")
                         tooltip = f"{a.get('negocio')} · {pm2_txt}/m²"
+                        etiqueta_lucro = None   # etiqueta fixa no mapa (verde/amarelo)
                         if retrofit_ligado and a["negocio"] == "Venda":
                             cls = classificar_retrofit(
-                                a["lat"], a["lon"], pm2, reformados_df,
-                                custo_obra_m2=retrofit_obra, desconto=retrofit_desconto,
+                                a["lat"], a["lon"],
+                                valor_pedido=a.get("valor"),
+                                area_construida=a.get("area_construida"),
+                                area_terreno=a.get("area_terreno"),
+                                reformados_df=reformados_df,
+                                custo_obra_m2=retrofit_obra,
+                                desconto=retrofit_desconto,
+                                area_projetada=retrofit_area_proj,
                                 valor_saida_fixo=(retrofit_venda_m2 if usa_manual else None))
                             cor = cls.get("cor", "cinza")
                             contagem_retrofit[cor] = contagem_retrofit.get(cor, 0) + 1
@@ -2348,59 +2391,95 @@ if rua or distrito_alvo != "Selecione...":
                             else:
                                 nome_cor = {"verde": "🟢 VERDE", "amarelo": "🟡 AMARELO",
                                             "vermelho": "🔴 VERMELHO"}[cor]
-                                # a origem do preço de venda muda conforme o modo
-                                if cls.get("modo") == "manual":
-                                    linha_saida = (
-                                        f"venda estimada (definida): "
-                                        f"{formata_moeda(cls['praticado'])}/m²<br>"
-                                        f"<b>{cls['excesso']*100:+.0f}%</b> vs venda estimada"
-                                    )
+                                # origem do preço de venda
+                                if cls["modo"] == "manual":
+                                    origem_venda = "definida por você"
                                 else:
-                                    linha_saida = (
-                                        f"venda (reformados ao redor): "
-                                        f"{formata_moeda(cls['praticado'])}/m²<br>"
-                                        f"<b>{cls['excesso']*100:+.0f}%</b> vs praticado · "
-                                        f"<span style='color:#555'>{cls['n_reformados']} ref. "
-                                        f"em {cls['raio_usado']}m</span>"
-                                    )
+                                    origem_venda = (f"{cls['n_reformados']} reformados "
+                                                    f"em {cls['raio_usado']}m")
+                                # lente de leitura: R$/m² de terreno
+                                linha_terreno = ""
+                                if cls.get("compra_m2_terreno"):
+                                    linha_terreno = (
+                                        f" <span style='color:#555'>"
+                                        f"({formata_moeda(cls['compra_m2_terreno'])}/m² terreno)"
+                                        f"</span>")
+                                # área usada na obra/venda
+                                if cls["ampliou"]:
+                                    linha_area = (
+                                        f"<span style='color:#555'>área de venda: "
+                                        f"{cls['area_venda']:.0f} m² "
+                                        f"(projetada; atual {float(a['area_construida']):.0f})"
+                                        f"</span><br>")
+                                else:
+                                    linha_area = (
+                                        f"<span style='color:#555'>área de venda: "
+                                        f"{cls['area_venda']:.0f} m² (atual)</span><br>")
                                 html += (
                                     "<hr style='margin:4px 0'>"
                                     f"<b>Retrofit: {nome_cor}</b><br>"
-                                    f"compra ({int(retrofit_desconto*100)}% desc.): "
-                                    f"{formata_moeda(cls['preco_descontado'])}/m²<br>"
-                                    f"+ obra: {formata_moeda(retrofit_obra)}/m²<br>"
-                                    f"= <b>custo total {formata_moeda(cls['custo_entrada'])}/m²</b><br>"
-                                    + linha_saida
+                                    + linha_area
+                                    + f"compra ({int(retrofit_desconto*100)}% desc.): "
+                                    f"{formata_moeda(cls['compra'])}{linha_terreno}<br>"
+                                    f"+ obra ({formata_moeda(retrofit_obra)}/m² × "
+                                    f"{cls['area_venda']:.0f}): {formata_moeda(cls['obra'])}<br>"
+                                    f"= custo total: <b>{formata_moeda(cls['custo_total'])}</b><br>"
+                                    f"venda ({formata_moeda(cls['venda_m2'])}/m² constr., "
+                                    f"{origem_venda}): {formata_moeda(cls['receita'])}<br>"
+                                    "<hr style='margin:4px 0'>"
+                                    f"<b>Lucro: {formata_moeda(cls['lucro'])} "
+                                    f"({cls['lucro_pct']*100:+.1f}%)</b>"
                                 )
-                                tooltip = f"{nome_cor} · {cls['excesso']*100:+.0f}%"
+                                tooltip = f"{nome_cor} · lucro {cls['lucro_pct']*100:+.1f}%"
+                                # etiqueta fixa no mapa: só verdes e amarelas
+                                if cor in ("verde", "amarelo"):
+                                    etiqueta_lucro = f"{cls['lucro_pct']*100:+.0f}%"
                         html += "</div>"
 
+                        # Um marcador aceita só UM tooltip: quando há etiqueta de lucro,
+                        # ela vira o tooltip permanente (fica visível sem clicar).
+                        # Os detalhes seguem no popup (clique).
+                        if etiqueta_lucro:
+                            fundo = "#1b7837" if cor == "verde" else "#b8860b"
+                            tip = folium.Tooltip(
+                                f"<span style='background:{fundo};color:#fff;"
+                                f"padding:1px 5px;border-radius:3px;font-weight:700;"
+                                f"font-size:11px;white-space:nowrap'>"
+                                f"{etiqueta_lucro}</span>",
+                                permanent=True, direction="right", offset=(8, 0))
+                        else:
+                            tip = tooltip
                         folium.Marker(
                             location=[a["lat"], a["lon"]],
                             icon=folium.Icon(color=cor_pino, icon="home", prefix="fa"),
-                            popup=folium.Popup(html, max_width=260),
-                            tooltip=tooltip,
+                            popup=folium.Popup(html, max_width=280),
+                            tooltip=tip,
                         ).add_to(m)
 
                     n_v = int((anuncios_regiao["negocio"] == "Venda").sum())
                     n_a = int((anuncios_regiao["negocio"] == "Aluguel").sum())
                     if retrofit_ligado:
                         if usa_manual:
-                            origem = (f"venda estimada por você em "
-                                      f"**{formata_moeda(retrofit_venda_m2)}/m²**")
+                            origem = (f"venda definida por você em "
+                                      f"**{formata_moeda(retrofit_venda_m2)}/m²** construído")
                         else:
-                            origem = ("preço dos **reformados ao redor** (respeita "
-                                      "período, uso e zonas excluídas)")
+                            origem = ("R$/m² construído dos **reformados ao redor** "
+                                      "(respeita período, uso e zonas excluídas)")
+                        area_txt = (f"área de venda: **{retrofit_area_proj} m² projetados** "
+                                    f"(ou a atual, se maior)"
+                                    if retrofit_area_proj else
+                                    "área de venda: a **atual** de cada imóvel")
                         st.caption(
-                            f"🎯 **Retrofit** — {contagem_retrofit['verde']} 🟢 viáveis · "
-                            f"{contagem_retrofit['amarelo']} 🟡 apertados · "
-                            f"{contagem_retrofit['vermelho']} 🔴 inviáveis · "
+                            f"🎯 **Retrofit** — {contagem_retrofit['verde']} 🟢 lucro ≥15% · "
+                            f"{contagem_retrofit['amarelo']} 🟡 lucro 0–15% · "
+                            f"{contagem_retrofit['vermelho']} 🔴 prejuízo · "
                             f"{contagem_retrofit['cinza']} ⚪ sem dados. "
-                            f"Saída = {origem}. "
-                            f"Verde = compra+obra fica na venda ou abaixo; "
-                            f"amarelo = até 15% acima; vermelho = mais de 15% acima. "
-                            f"Desconto {int(retrofit_desconto*100)}%, obra "
-                            f"{formata_moeda(retrofit_obra)}/m². Clique no pino para a conta.")
+                            f"**Lucro = (venda − compra − obra) ÷ (compra + obra)**. "
+                            f"Compra = pedido −{int(retrofit_desconto*100)}% (mostrada também "
+                            f"por m² de terreno); obra = {formata_moeda(retrofit_obra)}/m² × "
+                            f"área de venda; venda = {origem}. {area_txt.capitalize()}. "
+                            f"A etiqueta no mapa mostra o lucro % (só verdes e amarelas); "
+                            f"clique no pino para a conta completa.")
                     else:
                         st.caption(f"📣 **Anúncios (Matú)** — {len(anuncios_regiao)} nesta região "
                                    f"({n_v} venda, {n_a} aluguel). Pino preto = venda, "
