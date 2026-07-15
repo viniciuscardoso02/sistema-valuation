@@ -1230,6 +1230,7 @@ if ANUNCIOS_DF is None:
     anuncio_negocios = []
     anuncios_heatmap = "Desligado"
     retrofit_ligado = False
+    retrofit_etiquetas = True
     retrofit_desconto = 0.15
     retrofit_obra = 4000
     retrofit_piso = 5000
@@ -1268,6 +1269,12 @@ else:
         "Classificar anúncios para retrofit", value=False,
         help="Compra = preço pedido − desconto. Custo total = compra + obra. "
              "Compara com o preço de venda (dos reformados ao redor ou o que você definir).",
+    )
+    retrofit_etiquetas = st.sidebar.checkbox(
+        "↳ Mostrar % de lucro no mapa", value=True, disabled=not retrofit_ligado,
+        help="Etiqueta fixa ao lado dos pinos verdes e amarelos. Desligue para "
+             "limpar o mapa — a cor do pino continua indicando a classificação, e "
+             "o lucro segue no popup e na tabela abaixo do mapa.",
     )
     retrofit_desconto = st.sidebar.slider(
         "Desconto de negociação (%)", 0, 40, 15, disabled=not retrofit_ligado,
@@ -2311,6 +2318,7 @@ if rua or distrito_alvo != "Selecione...":
 
             # --- Camada de anúncios (preço pedido), base separada ---
             anuncios_regiao = None
+            linhas_tabela = []   # alimenta a tabela abaixo do mapa
             if (mostrar_anuncios or retrofit_ligado) and ANUNCIOS_DF is not None:
                 geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
                 # se retrofit está ligado, garante que Venda entra (a análise é de venda)
@@ -2367,6 +2375,7 @@ if rua or distrito_alvo != "Selecione...":
                         )
 
                         # classificação de retrofit (só venda)
+                        cls = {}
                         cor_pino = CORES_NEG.get(a["negocio"], "gray")
                         tooltip = f"{a.get('negocio')} · {pm2_txt}/m²"
                         etiqueta_lucro = None   # etiqueta fixa no mapa (verde/amarelo)
@@ -2432,9 +2441,44 @@ if rua or distrito_alvo != "Selecione...":
                                 )
                                 tooltip = f"{nome_cor} · lucro {cls['lucro_pct']*100:+.1f}%"
                                 # etiqueta fixa no mapa: só verdes e amarelas
-                                if cor in ("verde", "amarelo"):
+                                if cor in ("verde", "amarelo") and retrofit_etiquetas:
                                     etiqueta_lucro = f"{cls['lucro_pct']*100:+.0f}%"
                         html += "</div>"
+
+                        # --- alimenta a tabela abaixo do mapa ---
+                        cls_t = cls if (retrofit_ligado and a["negocio"] == "Venda") else {}
+                        linhas_tabela.append({
+                            "Situação": {"verde": "🟢 Vale", "amarelo": "🟡 Apertado",
+                                         "vermelho": "🔴 Não vale",
+                                         "cinza": "⚪ Sem dados"}.get(cls_t.get("cor"), "—"),
+                            "Lucro %": (round(cls_t["lucro_pct"] * 100, 1)
+                                        if cls_t.get("lucro_pct") is not None else None),
+                            "Lucro (R$)": cls_t.get("lucro"),
+                            "Obra (R$)": cls_t.get("obra"),
+                            "Custo total (R$)": cls_t.get("custo_total"),
+                            "Endereço": (f"{a.get('logradouro','s/ endereço')}"
+                                         f"{', ' + str(int(float(num))) if pd.notna(num) else ''}"),
+                            "Tipo": a.get("subtipo"),
+                            "Negócio": a.get("negocio"),
+                            "Pedido (R$)": a.get("valor"),
+                            "R$/m² pedido": (round(pm2) if pd.notna(pm2) else None),
+                            "Compra c/ desc. (R$)": cls_t.get("compra"),
+                            "Compra R$/m² terreno": (round(cls_t["compra_m2_terreno"])
+                                                     if cls_t.get("compra_m2_terreno") else None),
+                            "Venda estimada (R$)": cls_t.get("receita"),
+                            "Venda R$/m² constr.": (round(cls_t["venda_m2"])
+                                                    if cls_t.get("venda_m2") else None),
+                            "Área de venda (m²)": cls_t.get("area_venda"),
+                            "Área constr. (m²)": a.get("area_construida"),
+                            "Área terreno (m²)": a.get("area_terreno"),
+                            "Dorm": a.get("dorm"), "Banh": a.get("banh"),
+                            "Suíte": a.get("suite"), "Vaga": a.get("vaga"),
+                            "Bairro": a.get("bairro"), "CEP": a.get("cep"),
+                            "Base da venda": ("definida" if cls_t.get("modo") == "manual"
+                                              else (f"{cls_t['n_reformados']} ref. em "
+                                                    f"{cls_t['raio_usado']}m"
+                                                    if cls_t.get("n_reformados") else None)),
+                        })
 
                         # Um marcador aceita só UM tooltip: quando há etiqueta de lucro,
                         # ela vira o tooltip permanente (fica visível sem clicar).
@@ -2478,8 +2522,10 @@ if rua or distrito_alvo != "Selecione...":
                             f"Compra = pedido −{int(retrofit_desconto*100)}% (mostrada também "
                             f"por m² de terreno); obra = {formata_moeda(retrofit_obra)}/m² × "
                             f"área de venda; venda = {origem}. {area_txt.capitalize()}. "
-                            f"A etiqueta no mapa mostra o lucro % (só verdes e amarelas); "
-                            f"clique no pino para a conta completa.")
+                            + ("A etiqueta no mapa mostra o lucro % (só verdes e amarelas); "
+                               if retrofit_etiquetas else "")
+                            + "Clique no pino para a conta completa; a tabela abaixo do "
+                              "mapa lista tudo e pode ser ordenada.")
                     else:
                         st.caption(f"📣 **Anúncios (Matú)** — {len(anuncios_regiao)} nesta região "
                                    f"({n_v} venda, {n_a} aluguel). Pino preto = venda, "
@@ -2528,6 +2574,58 @@ if rua or distrito_alvo != "Selecione...":
                                    f"oscilar — tente novamente em alguns segundos.")
 
             render_map(m)
+
+            # --- Tabela dos anúncios da região (ordenável) ---
+            if linhas_tabela:
+                tab = pd.DataFrame(linhas_tabela)
+                st.markdown("#### 📋 Anúncios da região (Matú)")
+                if retrofit_ligado:
+                    # ordem de leitura: primeiro o que interessa decidir
+                    ordem = ["Situação", "Lucro %", "Lucro (R$)", "Endereço", "Tipo",
+                             "Negócio", "Pedido (R$)", "R$/m² pedido",
+                             "Compra c/ desc. (R$)", "Compra R$/m² terreno",
+                             "Obra (R$)", "Custo total (R$)", "Venda estimada (R$)",
+                             "Venda R$/m² constr.", "Área de venda (m²)",
+                             "Área constr. (m²)", "Área terreno (m²)",
+                             "Dorm", "Banh", "Suíte", "Vaga", "Bairro", "CEP",
+                             "Base da venda"]
+                    tab = tab.sort_values("Lucro %", ascending=False, na_position="last")
+                    dica = ("Clique no cabeçalho de **Lucro %** ou **Obra (R$)** para "
+                            "ordenar. Já vem ordenada por lucro, do melhor para o pior.")
+                else:
+                    ordem = ["Endereço", "Tipo", "Negócio", "Pedido (R$)", "R$/m² pedido",
+                             "Área constr. (m²)", "Área terreno (m²)",
+                             "Dorm", "Banh", "Suíte", "Vaga", "Bairro", "CEP"]
+                    dica = ("Clique no cabeçalho de qualquer coluna para ordenar. "
+                            "Ligue a **análise de retrofit** na barra lateral para ver "
+                            "lucro, custo de obra e classificação.")
+                tab = tab[[c for c in ordem if c in tab.columns]]
+
+                # column_config formata sem quebrar a ordenação por clique no cabeçalho
+                cfg = {}
+                for c in ("Lucro (R$)", "Obra (R$)", "Custo total (R$)", "Pedido (R$)",
+                          "Compra c/ desc. (R$)", "Venda estimada (R$)"):
+                    if c in tab.columns:
+                        cfg[c] = st.column_config.NumberColumn(c, format="R$ %.0f")
+                for c in ("R$/m² pedido", "Compra R$/m² terreno", "Venda R$/m² constr."):
+                    if c in tab.columns:
+                        cfg[c] = st.column_config.NumberColumn(c, format="R$ %.0f")
+                for c in ("Área de venda (m²)", "Área constr. (m²)", "Área terreno (m²)"):
+                    if c in tab.columns:
+                        cfg[c] = st.column_config.NumberColumn(c, format="%.0f m²")
+                if "Lucro %" in tab.columns:
+                    cfg["Lucro %"] = st.column_config.NumberColumn(
+                        "Lucro %", format="%.1f%%",
+                        help="(venda − compra − obra) ÷ (compra + obra)")
+
+                st.dataframe(tab, use_container_width=True, hide_index=True,
+                             height=380, column_config=cfg)
+                st.caption(dica + "  Os valores seguem os parâmetros da barra lateral "
+                                  "(desconto, obra, área projetada, preço de venda).")
+                st.download_button(
+                    "⬇️ Baixar esta tabela (CSV)",
+                    tab.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="anuncios_regiao.csv", mime="text/csv")
 
             # contagem de POIs abaixo do mapa (indicador da região)
             if contagem_pois:
