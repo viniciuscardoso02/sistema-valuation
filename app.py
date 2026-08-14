@@ -2379,6 +2379,7 @@ if rua or distrito_alvo != "Selecione...":
             linhas_tabela = []   # alimenta a tabela abaixo do mapa
 
             # --- Camada SLC-e: tapume / estande de vendas (sinal precoce) ---
+            slce_regiao = None   # recorte SLC-e da região, para a lista abaixo do mapa
             if mostrar_slce and SLCE_DF is not None and slce_tipos:
                 geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
                 sl = SLCE_DF[SLCE_DF["mapeavel"] &
@@ -2390,6 +2391,7 @@ if rua or distrito_alvo != "Selecione...":
                 elif centro is not None and raio:
                     sl = sl[sl.apply(lambda r: _dist_m(centro[0], centro[1],
                                                        r["lat"], r["lon"]) <= raio, axis=1)]
+                slce_regiao = sl
                 CORES_SLCE = {"Tapume": "orange", "Estande de Vendas": "blue", "Grua": "purple"}
                 for _, s in sl.iterrows():
                     data_txt = ""
@@ -2678,7 +2680,39 @@ if rua or distrito_alvo != "Selecione...":
 
             render_map(m)
 
-            # --- Tabela dos anúncios da região (ordenável) ---
+            # --- Lista dos últimos tapumes emitidos ---
+            if mostrar_slce and SLCE_DF is not None:
+                st.markdown("#### 🚧 Últimos tapumes emitidos")
+                cidade_toda = st.toggle(
+                    "Ver a cidade toda (ignora o recorte da região)", value=False,
+                    key="slce_lista_cidade",
+                    help="Por padrão a lista mostra os tapumes da região no mapa. "
+                         "Ligue para ver os mais recentes de todo o município.")
+                if cidade_toda:
+                    fonte_tap = SLCE_DF[SLCE_DF["tipo_alvara"] == "Tapume"].copy()
+                    escopo_txt = "todo o município"
+                else:
+                    base_reg = slce_regiao if slce_regiao is not None else \
+                        SLCE_DF.iloc[0:0]
+                    fonte_tap = base_reg[base_reg["tipo_alvara"] == "Tapume"].copy()
+                    escopo_txt = "a região no mapa"
+
+                fonte_tap = fonte_tap.sort_values("data_emissao", ascending=False).head(10)
+                if fonte_tap.empty:
+                    st.caption(f"Nenhum tapume em {escopo_txt} com os filtros atuais.")
+                else:
+                    lista_tap = pd.DataFrame({
+                        "Data": pd.to_datetime(fonte_tap["data_emissao"]).dt.strftime("%d/%m/%Y"),
+                        "Endereço": fonte_tap["endereco"],
+                        "SQL": fonte_tap["sql_norm"],
+                        "Processo": fonte_tap["processo"],
+                        "Situação": fonte_tap["situacao"],
+                    })
+                    st.dataframe(lista_tap, use_container_width=True, hide_index=True)
+                    st.caption(f"Os 10 tapumes mais recentes de {escopo_txt}. O tapume é o "
+                               f"sinal mais precoce de obra — sai antes do alvará de execução.")
+
+
             if linhas_tabela:
                 tab = pd.DataFrame(linhas_tabela)
                 st.markdown("#### 📋 Anúncios da região (Matú)")
