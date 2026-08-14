@@ -405,6 +405,35 @@ def carregar_anuncios(caminho):
 ANUNCIOS_DF = carregar_anuncios(ANUNCIOS_PATH)
 
 
+# --- Alvarás SLC-e (tapume / estande de vendas), obtidos via LAI ---
+SLCE_PATH = os.path.join(APP_DIR, "alvaras_slce.parquet")
+if not os.path.exists(SLCE_PATH):
+    SLCE_PATH = "alvaras_slce.parquet"
+
+
+@st.cache_data(show_spinner=False)
+def carregar_slce(caminho):
+    """Alvarás autodeclaratórios do SLC-e (tapume, estande, grua) — sinal PRECOCE
+    de obra: o tapume virou autodeclaratório em 2025 e sai antes do alvará de
+    execução. Coordenada vem do cruzamento por SQL com o ITBI (feito no Colab).
+    Retorna None se a base não estiver no repositório."""
+    try:
+        df = pd.read_parquet(caminho)
+        for c in ("lat", "lon", "ano"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        if {"lat", "lon"}.issubset(df.columns):
+            dentro = (df["lat"].between(BBOX_SP[0], BBOX_SP[1]) &
+                      df["lon"].between(BBOX_SP[2], BBOX_SP[3]))
+            df.loc[~dentro, ["lat", "lon"]] = np.nan
+        return df
+    except Exception:
+        return None
+
+
+SLCE_DF = carregar_slce(SLCE_PATH)
+
+
 def _dist_m(lat1, lon1, lat2, lon2):
     """Distância aproximada em metros (equirretangular; suficiente p/ raios curtos)."""
     import math
@@ -1221,6 +1250,35 @@ alvara_familias = st.sidebar.multiselect(
          "Desmarque alguma para ocultá-la.",
     disabled=not mostrar_alvaras,
 )
+
+# --- Alvarás SLC-e (tapume / estande) — sinal precoce de obra ---
+if SLCE_DF is not None:
+    mostrar_slce = st.sidebar.checkbox(
+        "Tapume / estande de vendas (SLC-e)", value=False,
+        help="Alvarás autodeclaratórios do SLC-e (obtidos via LAI). O tapume é o "
+             "sinal MAIS PRECOCE de obra — sai antes do alvará de execução. "
+             "Estande de vendas antecede lançamentos. Pino laranja = tapume, "
+             "azul = estande. Posição pelo SQL cruzado com o ITBI.",
+    )
+    slce_tipos = st.sidebar.multiselect(
+        "↳ Tipos a mostrar", ["Tapume", "Estande de Vendas", "Grua"],
+        default=["Tapume", "Estande de Vendas"],
+        disabled=not mostrar_slce,
+    )
+    _anos_slce = SLCE_DF["ano"].dropna()
+    if len(_anos_slce):
+        slce_ano_min = st.sidebar.slider(
+            "↳ A partir do ano", int(_anos_slce.min()), int(_anos_slce.max()),
+            max(2024, int(_anos_slce.min())), disabled=not mostrar_slce,
+            help="O tapume virou autodeclaratório em 2025 — filtre por 2025+ para "
+                 "ver só os sinais mais recentes e precoces.",
+        )
+    else:
+        slce_ano_min = 2020
+else:
+    mostrar_slce = False
+    slce_tipos = []
+    slce_ano_min = 2020
 
 st.sidebar.markdown("---")
 st.sidebar.header("📣 Anúncios (Matú Imóveis)")
@@ -2319,6 +2377,51 @@ if rua or distrito_alvo != "Selecione...":
             # --- Camada de anúncios (preço pedido), base separada ---
             anuncios_regiao = None
             linhas_tabela = []   # alimenta a tabela abaixo do mapa
+
+            # --- Camada SLC-e: tapume / estande de vendas (sinal precoce) ---
+            if mostrar_slce and SLCE_DF is not None and slce_tipos:
+                geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
+                sl = SLCE_DF[SLCE_DF["mapeavel"] &
+                             SLCE_DF["tipo_alvara"].isin(slce_tipos) &
+                             (SLCE_DF["ano"] >= slce_ano_min)].copy()
+                if modo_distrito and geom_d is not None:
+                    sl = sl[sl.apply(lambda r: _ponto_em_geom(r["lat"], r["lon"], geom_d),
+                                     axis=1)]
+                elif centro is not None and raio:
+                    sl = sl[sl.apply(lambda r: _dist_m(centro[0], centro[1],
+                                                       r["lat"], r["lon"]) <= raio, axis=1)]
+                CORES_SLCE = {"Tapume": "orange", "Estande de Vendas": "blue", "Grua": "purple"}
+                for _, s in sl.iterrows():
+                    data_txt = ""
+                    if pd.notna(s.get("data_emissao")):
+                        try:
+                            data_txt = pd.to_datetime(s["data_emissao"]).strftime("%d/%m/%Y")
+                        except Exception:
+                            data_txt = str(int(s["ano"])) if pd.notna(s.get("ano")) else ""
+                    html_s = (
+                        f"<div style='font-size:13px'>"
+                        f"<b>{s.get('tipo_alvara','—')}</b><br>"
+                        f"{s.get('endereco','')}<br>"
+                        f"<span style='color:#555'>emitido em {data_txt} · "
+                        f"{s.get('situacao','')}</span><br>"
+                        f"<span style='color:#555'>proc. {s.get('processo','')}</span></div>"
+                    )
+                    folium.Marker(
+                        location=[s["lat"], s["lon"]],
+                        icon=folium.Icon(color=CORES_SLCE.get(s["tipo_alvara"], "gray"),
+                                         icon="wrench", prefix="fa"),
+                        popup=folium.Popup(html_s, max_width=260),
+                        tooltip=f"{s['tipo_alvara']} · {data_txt}",
+                    ).add_to(m)
+                n_tap = int((sl["tipo_alvara"] == "Tapume").sum())
+                n_est = int((sl["tipo_alvara"] == "Estande de Vendas").sum())
+                st.caption(
+                    f"🚧 **SLC-e** — {len(sl)} alvarás nesta região a partir de "
+                    f"{slce_ano_min} ({n_tap} tapume, {n_est} estande). "
+                    f"Pino laranja = tapume, azul = estande. O tapume é o sinal mais "
+                    f"precoce de obra — sai antes do alvará de execução. Fonte: LAI/SLC-e, "
+                    f"posição pelo SQL cruzado com o ITBI.")
+
             if (mostrar_anuncios or retrofit_ligado) and ANUNCIOS_DF is not None:
                 geom_d = feature_dist.get("geometry") if (modo_distrito and feature_dist) else None
                 # se retrofit está ligado, garante que Venda entra (a análise é de venda)
